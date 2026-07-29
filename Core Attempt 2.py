@@ -26,6 +26,8 @@ import json
 import datetime
 import logging
 import os
+import tempfile
+import shutil
 from typing import List, Dict, Optional, Any
 
 # Configure logging for monitoring and debugging
@@ -815,6 +817,637 @@ class DuckDBSyncManager:
         """Close the DuckDB database connection."""
         self.conn.close()
 
+
+class SQLiteBlobManager:
+    """
+    Class 3: Manages Binary Large Objects (BLOBs) in SQLite with full audit trail.
+    
+    This class handles storage and retrieval of binary files (PDFs, images, documents, etc.)
+    with comprehensive tracking:
+    - Stores blob data as BLOB type in SQLite
+    - Tracks blob name for recall, source filepath, upload timestamp, and user
+    - Maintains audit log of all blob operations (upload, download, delete)
+    - Supports versioning - multiple uploads of same name create new versions
+    - Provides get() method that opens blobs in temporary files for viewing
+    
+    Database Schema:
+    - blobs: Current blob metadata (name, source_filepath, checksum, size, uploaded_by, uploaded_at)
+    - blob_data: Actual binary content linked to blob metadata
+    - blob_history: Version history of all blob changes
+    - blob_tx_log: Audit trail of all blob transactions
+    
+    Usage Example:
+        blob_mgr = SQLiteBlobManager(db_path="blobs.db", default_user="analyst_1")
+        blob_mgr.upload_blob("/path/to/file.pdf", name="quarterly_report", user="john_doe")
+        temp_path = blob_mgr.get("quarterly_report")  # Opens in temp file for viewing
+        blob_mgr.list_blobs()  # Shows all stored blobs
+    """
+    
+    def __init__(self, db_path: str, default_user: str = "system"):
+        """
+        Initialize the SQLite Blob Manager.
+        
+        Args:
+            db_path: Path to the SQLite database file for blob storage
+            default_user: Default username for audit logging when not specified
+        """
+        self.db_path = db_path
+        self.default_user = default_user
+        
+        # Ensure directory exists for database file
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        
+        # Connect to SQLite with timeout for concurrent access handling
+        self.conn = sqlite3.connect(self.db_path, timeout=10)
+        # Enable WAL mode for better concurrency
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Create database tables for blob storage and audit
+        self._initialize_schema()
+    
+    def _quote_id(self, name: str) -> str:
+        """
+        Safely quote SQL identifiers to prevent SQL injection.
+        
+        Args:
+            name: The column or table name to quote
+            
+        Returns:
+            Properly quoted identifier wrapped in double quotes
+        """
+        return f'"{name.replace(chr(34), chr(34)+chr(34))}"'
+    
+    def _initialize_schema(self):
+        """
+        Create all required database tables for blob storage and audit.
+        
+        Tables created:
+        - blobs: Current blob metadata (name, source path, checksum, size, timestamps)
+        - blob_data: Binary content storage linked to blob metadata
+        - blob_history: Full version history of blob changes
+        - blob_tx_log: Audit trail of all blob operations
+        """
+        cur = self.conn.cursor()
+        
+        # Create blobs metadata table - tracks current state of each named blob
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                source_filepath TEXT,
+                checksum TEXT,
+                size_bytes INTEGER,
+                uploaded_by TEXT,
+                uploaded_at TEXT,
+                last_modified_by TEXT,
+                last_modified_at TEXT
+            )
+        """)
+        
+        # Create blob_data table - stores actual binary content
+        # Separate from metadata for efficient storage and retrieval
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blob_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blob_id INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                FOREIGN KEY(blob_id) REFERENCES blobs(id)
+            )
+        """)
+        
+        # Create blob_history table - version history for auditing
+        # Each row represents a snapshot of blob state at a point in time
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blob_history (
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_id INTEGER,
+                blob_name TEXT,
+                source_filepath TEXT,
+                checksum TEXT,
+                size_bytes INTEGER,
+                operation TEXT,
+                timestamp TEXT,
+                user TEXT,
+                FOREIGN KEY(tx_id) REFERENCES blob_tx_log(tx_id)
+            )
+        """)
+        
+        # Create blob_tx_log table - audit trail for all blob operations
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blob_tx_log (
+                tx_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                user TEXT,
+                operation TEXT,
+                blob_name TEXT,
+                old_source_filepath TEXT,
+                new_source_filepath TEXT,
+                status TEXT
+            )
+        """)
+        
+        self.conn.commit()
+    
+    def _compute_checksum(self, data: bytes) -> str:
+        """
+        Compute SHA-256 checksum of blob data for integrity verification.
+        
+        Args:
+            data: Binary data to compute checksum for
+            
+        Returns:
+            Hexadecimal string representation of SHA-256 hash
+        """
+        import hashlib
+        return hashlib.sha256(data).hexdigest()
+    
+    def upload_blob(self, filepath: str, name: str, user: Optional[str] = None) -> int:
+        """
+        Upload a file to blob storage with full audit tracking.
+        
+        Reads file from disk, stores binary data in blob_data table,
+        updates metadata in blobs table, and logs transaction.
+        
+        Args:
+            filepath: Path to the file on disk to upload
+            name: Unique name to identify this blob for later retrieval
+            user: Username for audit logging (defaults to self.default_user)
+            
+        Returns:
+            Blob ID (primary key) of the uploaded/updated blob
+            
+        Raises:
+            FileNotFoundError: If filepath does not exist
+            IOError: If file cannot be read
+            
+        Example:
+            blob_id = blob_mgr.upload_blob("/docs/report.pdf", name="quarterly_report", user="john")
+        """
+        user = user or self.default_user
+        
+        # Validate file exists before proceeding
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+        
+        # Read file binary data
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        
+        # Compute checksum and size for integrity tracking
+        checksum = self._compute_checksum(data)
+        size_bytes = len(data)
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        cur = self.conn.cursor()
+        
+        try:
+            cur.execute("BEGIN IMMEDIATE;")
+            
+            # Check if blob with this name already exists
+            cur.execute("SELECT id, source_filepath FROM blobs WHERE name = ?", (name,))
+            existing = cur.fetchone()
+            
+            if existing:
+                # UPDATE existing blob
+                blob_id, old_source = existing
+                
+                # Update blobs metadata table
+                cur.execute("""
+                    UPDATE blobs SET 
+                        source_filepath = ?, checksum = ?, size_bytes = ?,
+                        last_modified_by = ?, last_modified_at = ?
+                    WHERE id = ?
+                """, (filepath, checksum, size_bytes, user, now, blob_id))
+                
+                # Insert new binary data into blob_data (versioning support)
+                cur.execute("""
+                    INSERT INTO blob_data (blob_id, data, uploaded_at) VALUES (?, ?, ?)
+                """, (blob_id, data, now))
+                
+                # Log transaction as EDIT
+                cur.execute("""
+                    INSERT INTO blob_tx_log 
+                    (timestamp, user, operation, blob_name, old_source_filepath, new_source_filepath, status)
+                    VALUES (?, ?, 'EDIT', ?, ?, ?, 'SUCCESS')
+                """, (now, user, name, old_source, filepath))
+                
+                # Record in history
+                cur.execute("""
+                    INSERT INTO blob_history 
+                    (tx_id, blob_name, source_filepath, checksum, size_bytes, operation, timestamp, user)
+                    SELECT last_insert_rowid(), ?, ?, ?, ?, 'EDIT', ?, ?
+                """, (name, filepath, checksum, size_bytes, now, user))
+                
+            else:
+                # INSERT new blob
+                cur.execute("""
+                    INSERT INTO blobs 
+                    (name, source_filepath, checksum, size_bytes, uploaded_by, uploaded_at, last_modified_by, last_modified_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, filepath, checksum, size_bytes, user, now, user, now))
+                
+                blob_id = cur.lastrowid
+                
+                # Insert binary data
+                cur.execute("""
+                    INSERT INTO blob_data (blob_id, data, uploaded_at) VALUES (?, ?, ?)
+                """, (blob_id, data, now))
+                
+                # Log transaction as APPEND
+                cur.execute("""
+                    INSERT INTO blob_tx_log 
+                    (timestamp, user, operation, blob_name, old_source_filepath, new_source_filepath, status)
+                    VALUES (?, ?, 'APPEND', ?, NULL, ?, 'SUCCESS')
+                """, (now, user, name, filepath))
+                
+                # Record in history
+                cur.execute("""
+                    INSERT INTO blob_history 
+                    (tx_id, blob_name, source_filepath, checksum, size_bytes, operation, timestamp, user)
+                    SELECT last_insert_rowid(), ?, ?, ?, ?, 'APPEND', ?, ?
+                """, (name, filepath, checksum, size_bytes, now, user))
+            
+            self.conn.commit()
+            logging.info(f"Blob '{name}' uploaded successfully by {user} (size: {size_bytes} bytes)")
+            return blob_id
+            
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"Failed to upload blob '{name}': {e}")
+            raise
+    
+    def get(self, name: str, user: Optional[str] = None) -> str:
+        """
+        Retrieve a blob and open it in a temporary file for viewing.
+        
+        Fetches binary data from database, writes to a secure temporary file,
+        and returns the temp file path. Caller is responsible for cleanup.
+        
+        Args:
+            name: Name of the blob to retrieve
+            user: Username for audit logging (defaults to self.default_user)
+            
+        Returns:
+            Path to temporary file containing the blob data
+            
+        Raises:
+            ValueError: If blob with given name does not exist
+            
+        Example:
+            temp_path = blob_mgr.get("quarterly_report")
+            # Open with default application: os.startfile(temp_path)  # Windows
+            # Or read directly: with open(temp_path, 'rb') as f: data = f.read()
+            # Cleanup: os.remove(temp_path)
+        """
+        user = user or self.default_user
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        cur = self.conn.cursor()
+        
+        # Get blob metadata and latest data
+        cur.execute("""
+            SELECT b.id, b.source_filepath, bd.data 
+            FROM blobs b
+            JOIN blob_data bd ON b.id = bd.blob_id
+            WHERE b.name = ?
+            ORDER BY bd.uploaded_at DESC
+            LIMIT 1
+        """, (name,))
+        
+        result = cur.fetchone()
+        
+        if not result:
+            raise ValueError(f"Blob '{name}' not found in database")
+        
+        blob_id, source_filepath, data = result
+        
+        # Log the retrieval operation
+        cur.execute("""
+            INSERT INTO blob_tx_log 
+            (timestamp, user, operation, blob_name, old_source_filepath, new_source_filepath, status)
+            VALUES (?, ?, 'RETRIEVE', ?, NULL, ?, 'SUCCESS')
+        """, (now, user, name, source_filepath))
+        self.conn.commit()
+        
+        # Create temporary file with appropriate extension if known
+        ext = os.path.splitext(source_filepath)[1] if source_filepath else '.bin'
+        temp_fd, temp_path = tempfile.mkstemp(suffix=ext, prefix=f"blob_{name}_")
+        
+        try:
+            # Write blob data to temp file
+            with os.fdopen(temp_fd, 'wb') as f:
+                f.write(data)
+            
+            logging.info(f"Blob '{name}' retrieved by {user} to temp file: {temp_path}")
+            return temp_path
+            
+        except Exception as e:
+            os.close(temp_fd)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            logging.error(f"Failed to write blob '{name}' to temp file: {e}")
+            raise
+    
+    def list_blobs(self) -> pd.DataFrame:
+        """
+        List all blobs in storage with their metadata.
+        
+        Returns:
+            Pandas DataFrame with columns: name, source_filepath, checksum, 
+            size_bytes, uploaded_by, uploaded_at, last_modified_by, last_modified_at
+        """
+        query = """
+            SELECT name, source_filepath, checksum, size_bytes, 
+                   uploaded_by, uploaded_at, last_modified_by, last_modified_at
+            FROM blobs
+            ORDER BY name
+        """
+        return pd.read_sql_query(query, self.conn)
+    
+    def get_audit_log(self, name: Optional[str] = None) -> pd.DataFrame:
+        """
+        Retrieve audit log for blob operations.
+        
+        Args:
+            name: Optional blob name to filter by (if None, returns all)
+            
+        Returns:
+            Pandas DataFrame with audit log entries
+        """
+        if name:
+            query = """
+                SELECT tx_id, timestamp, user, operation, blob_name, 
+                       old_source_filepath, new_source_filepath, status
+                FROM blob_tx_log
+                WHERE blob_name = ?
+                ORDER BY timestamp DESC
+            """
+            params = (name,)
+        else:
+            query = """
+                SELECT tx_id, timestamp, user, operation, blob_name, 
+                       old_source_filepath, new_source_filepath, status
+                FROM blob_tx_log
+                ORDER BY timestamp DESC
+            """
+            params = ()
+        
+        return pd.read_sql_query(query, self.conn, params=params)
+    
+    def delete_blob(self, name: str, user: Optional[str] = None):
+        """
+        Delete a blob from storage with full audit tracking.
+        
+        Note: This removes the blob metadata but preserves historical data
+        in blob_history for audit purposes. Binary data is retained for 
+        potential recovery until explicit purge.
+        
+        Args:
+            name: Name of the blob to delete
+            user: Username for audit logging (defaults to self.default_user)
+            
+        Raises:
+            ValueError: If blob with given name does not exist
+        """
+        user = user or self.default_user
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        
+        cur = self.conn.cursor()
+        
+        # Check if blob exists
+        cur.execute("SELECT id, source_filepath FROM blobs WHERE name = ?", (name,))
+        existing = cur.fetchone()
+        
+        if not existing:
+            raise ValueError(f"Blob '{name}' not found in database")
+        
+        blob_id, source_filepath = existing
+        
+        try:
+            cur.execute("BEGIN IMMEDIATE;")
+            
+            # Log deletion transaction
+            cur.execute("""
+                INSERT INTO blob_tx_log 
+                (timestamp, user, operation, blob_name, old_source_filepath, new_source_filepath, status)
+                VALUES (?, ?, 'DELETE', ?, ?, NULL, 'SUCCESS')
+            """, (now, user, name, source_filepath))
+            
+            # Record in history before deletion
+            cur.execute("""
+                INSERT INTO blob_history 
+                (tx_id, blob_name, source_filepath, operation, timestamp, user)
+                SELECT last_insert_rowid(), ?, ?, 'DELETE', ?, ?
+                FROM blobs WHERE id = ?
+            """, (name, source_filepath, now, user, blob_id))
+            
+            # Remove from blobs table (binary data retained for audit/recovery)
+            cur.execute("DELETE FROM blobs WHERE id = ?", (blob_id,))
+            
+            self.conn.commit()
+            logging.info(f"Blob '{name}' deleted successfully by {user}")
+            
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"Failed to delete blob '{name}': {e}")
+            raise
+    
+    def close(self):
+        """Close the SQLite database connection."""
+        self.conn.close()
+
+
+class DuckDBBlobSyncManager:
+    """
+    Class 4: Manages synchronization of BLOB metadata to DuckDB for analytics.
+    
+    While actual binary data remains in SQLite (optimized for BLOB storage),
+    this class syncs blob metadata to DuckDB for analytical queries:
+    - Syncs blob names, sizes, upload times, user info
+    - Enables reporting on blob usage patterns, storage trends
+    - Does NOT sync actual binary data (keeps DuckDB lean for analytics)
+    - Maintains incremental sync via transaction log tracking
+    
+    Database Schema (DuckDB):
+    - analytics_blobs: Metadata mirror for analytical queries
+    
+    Usage Example:
+        blob_sync = DuckDBBlobSyncManager(duckdb_path="analytics.duckdb", blob_manager=blob_mgr)
+        blob_sync.sync()  # Incremental sync of new/changed blobs
+        df = blob_sync.get()  # Query blob metadata analytics
+    """
+    
+    def __init__(self, duckdb_path: str, blob_manager: SQLiteBlobManager):
+        """
+        Initialize the DuckDB Blob Sync Manager.
+        
+        Args:
+            duckdb_path: Path to the DuckDB database file
+            blob_manager: Instance of SQLiteBlobManager to sync from
+        """
+        self.duckdb_path = duckdb_path
+        self.blob_mgr = blob_manager
+        
+        # Ensure directory exists for DuckDB file
+        os.makedirs(os.path.dirname(os.path.abspath(duckdb_path)), exist_ok=True)
+        
+        # Connect to DuckDB database
+        self.conn = duckdb.connect(self.duckdb_path)
+        
+        # Create metadata table to track sync progress
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS _blob_sync_metadata 
+            (key VARCHAR PRIMARY KEY, value BIGINT)
+        """)
+        self.conn.execute("""
+            INSERT OR IGNORE INTO _blob_sync_metadata 
+            VALUES ('last_synced_tx_id', 0)
+        """)
+        
+        # Create analytics tables for blob metadata
+        self._initialize_schema()
+    
+    def _quote_id(self, name: str) -> str:
+        """
+        Safely quote SQL identifiers for DuckDB.
+        
+        Args:
+            name: The column or table name to quote
+            
+        Returns:
+            Properly quoted identifier wrapped in double quotes
+        """
+        return f'"{name.replace(chr(34), chr(34)+chr(34))}"'
+    
+    def _initialize_schema(self):
+        """
+        Create DuckDB analytics table for blob metadata.
+        
+        Creates analytics_blobs table with metadata columns only
+        (no binary data - that stays in SQLite).
+        """
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_blobs (
+                id BIGINT,
+                name VARCHAR,
+                source_filepath VARCHAR,
+                checksum VARCHAR,
+                size_bytes BIGINT,
+                uploaded_by VARCHAR,
+                uploaded_at TIMESTAMP,
+                last_modified_by VARCHAR,
+                last_modified_at TIMESTAMP,
+                PRIMARY KEY (id)
+            )
+        """)
+    
+    def sync(self):
+        """
+        Incrementally sync blob metadata from SQLite to DuckDB.
+        
+        Processes only new transactions since last sync point for efficiency.
+        Handles APPEND, EDIT, and DELETE operations appropriately.
+        """
+        # Get last synced transaction ID
+        last_synced = self.conn.execute("""
+            SELECT value FROM _blob_sync_metadata 
+            WHERE key='last_synced_tx_id'
+        """).fetchone()[0]
+        
+        # Query SQLite for new blob transactions
+        new_txs = pd.read_sql_query("""
+            SELECT tx_id, operation, blob_name
+            FROM blob_tx_log 
+            WHERE tx_id > ? AND status='SUCCESS'
+        """, self.blob_mgr.conn, params=[last_synced])
+        
+        if new_txs.empty:
+            logging.info("No new blob transactions to sync.")
+            return
+        
+        logging.info(f"Syncing {len(new_txs)} blob transactions to DuckDB...")
+        
+        # Process each transaction
+        for _, tx in new_txs.iterrows():
+            tx_id = tx['tx_id']
+            operation = tx['operation']
+            blob_name = tx['blob_name']
+            
+            if operation == 'DELETE':
+                # Remove from DuckDB analytics
+                self.conn.execute("""
+                    DELETE FROM analytics_blobs WHERE name = ?
+                """, [blob_name])
+            else:
+                # APPEND or EDIT - fetch current state from SQLite
+                blob_data = pd.read_sql_query("""
+                    SELECT id, name, source_filepath, checksum, size_bytes,
+                           uploaded_by, uploaded_at, last_modified_by, last_modified_at
+                    FROM blobs WHERE name = ?
+                """, self.blob_mgr.conn, params=[blob_name])
+                
+                if not blob_data.empty:
+                    # Convert timestamps for DuckDB compatibility
+                    for col in ['uploaded_at', 'last_modified_at']:
+                        if col in blob_data.columns:
+                            blob_data[col] = pd.to_datetime(blob_data[col])
+                    
+                    # Upsert into DuckDB
+                    self.conn.execute("""
+                        INSERT OR REPLACE INTO analytics_blobs 
+                        SELECT * FROM blob_data
+                    """)
+        
+        # Update sync metadata
+        max_tx_id = new_txs['tx_id'].max()
+        self.conn.execute("""
+            UPDATE _blob_sync_metadata 
+            SET value = ? WHERE key='last_synced_tx_id'
+        """, [max_tx_id])
+        
+        logging.info(f"Blob sync complete. Updated to tx_id {max_tx_id}.")
+    
+    def get(self, **filters) -> pd.DataFrame:
+        """
+        Query analytics_blobs with optional filters.
+        
+        Args:
+            **filters: Keyword arguments for filtering (e.g., uploaded_by='john')
+            
+        Returns:
+            Pandas DataFrame with matching blob metadata
+        """
+        query = "SELECT * FROM analytics_blobs"
+        params = []
+        conditions = []
+        
+        for col, value in filters.items():
+            if '"' in col:
+                raise ValueError(f"Invalid column name: '{col}'")
+            
+            quoted_col = self._quote_id(col)
+            
+            if isinstance(value, (list, tuple, set)):
+                if not value:
+                    continue
+                placeholders = ','.join(['?'] * len(value))
+                conditions.append(f"{quoted_col} IN ({placeholders})")
+                params.extend(value)
+            else:
+                conditions.append(f"{quoted_col} = ?")
+                params.append(value)
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        return self.conn.execute(query, params).fetchdf()
+    
+    def close(self):
+        """Close the DuckDB database connection."""
+        self.conn.close()
+
 #%%
 # =============================================================================
 # DEMONSTRATION / USAGE EXAMPLE SECTION
@@ -882,6 +1515,77 @@ print(df_live)
 # Example filtered query (uncomment to use):
 # df_filtered = duckdb_manager.get(Date='2024-01-01', Organisation=['RBNZ'])
 
+# -----------------------------------------------------------------------------
+# Step 3: Initialize Class 3 (SQLite Blob Manager for Binary Files)
+# -----------------------------------------------------------------------------
+# Manages storage and retrieval of binary files with full audit trail
+blob_mgr = SQLiteBlobManager(
+    db_path=r"C:\Test\blobs.db",
+    default_user="data_engineer"
+)
+
+# --- SCENARIO 5: Upload a blob (e.g., PDF report, image, etc.) ---
+print("\n--- Uploading Blob ---")
+# Create a test file for demonstration
+test_file = r"C:\Test\test_document.pdf"
+os.makedirs(os.path.dirname(test_file), exist_ok=True)
+with open(test_file, 'wb') as f:
+    f.write(b"%PDF-1.4 Test PDF content for demonstration")
+
+# Upload blob with unique name for recall
+blob_id = blob_mgr.upload_blob(test_file, name="quarterly_report_q3_2024", user="analyst_1")
+print(f"Uploaded blob with ID: {blob_id}")
+
+# --- SCENARIO 6: List all stored blobs ---
+print("\n--- Listing Blobs ---")
+blobs_df = blob_mgr.list_blobs()
+print(blobs_df)
+
+# --- SCENARIO 7: Retrieve blob - opens in temp file for viewing ---
+print("\n--- Retrieving Blob ---")
+temp_path = blob_mgr.get("quarterly_report_q3_2024", user="analyst_2")
+print(f"Blob opened in temp file: {temp_path}")
+# In real usage, you could open it: os.startfile(temp_path)  # Windows
+# Or read the content: with open(temp_path, 'rb') as f: data = f.read()
+# Cleanup temp file after use: os.remove(temp_path)
+
+# --- SCENARIO 8: View audit log for blob operations ---
+print("\n--- Blob Audit Log ---")
+audit_df = blob_mgr.get_audit_log()
+print(audit_df)
+
+# --- SCENARIO 9: Delete a blob ---
+# Uncomment to test deletion:
+# blob_mgr.delete_blob("quarterly_report_q3_2024", user="analyst_1")
+
+# Cleanup
+# blob_mgr.close()
+
+# -----------------------------------------------------------------------------
+# Step 4: Initialize Class 4 (DuckDB Blob Sync Manager for Analytics)
+# -----------------------------------------------------------------------------
+# Syncs blob metadata to DuckDB for analytical queries
+blob_sync = DuckDBBlobSyncManager(
+    duckdb_path=r"C:\Test\blob_analytics.duckdb",
+    blob_manager=blob_mgr
+)
+
+# --- SCENARIO 10: Sync blob metadata to DuckDB ---
+print("\n--- Syncing Blob Metadata to DuckDB ---")
+blob_sync.sync()
+
+# --- SCENARIO 11: Query blob analytics ---
+print("\n--- Querying Blob Analytics ---")
+analytics_df = blob_sync.get()
+print(analytics_df)
+
+# Example filtered query:
+# filtered = blob_sync.get(uploaded_by='analyst_1')
+
+# Cleanup
+# blob_sync.close()
+
 # Cleanup (uncomment in production to properly close connections)
 # sqlite_db.close()
+# duckdb_manager.close()
 # duckdb_manager.close()
