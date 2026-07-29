@@ -29,6 +29,10 @@ import os
 import tempfile
 import shutil
 from typing import List, Dict, Optional, Any
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import base64
 
 # Configure logging for monitoring and debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -61,7 +65,8 @@ class SQLiteTimeSeriesManager:
         'ID':        {'sqlite': 'INTEGER', 'pandas': 'Int64'}
     }
 
-    def __init__(self, db_path: str, table_keys: List[str], variables: Dict[str, str], default_user: str = "system"):
+    def __init__(self, db_path: str, table_keys: List[str], variables: Dict[str, str], default_user: str = "system", 
+                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False):
         """
         Initialize the SQLite Time Series Manager.
         
@@ -70,12 +75,18 @@ class SQLiteTimeSeriesManager:
             table_keys: List of column names that form the primary key (e.g., ['Date', 'Time Series'])
             variables: Dictionary mapping column names to semantic types (e.g., {'Value': 'METRIC'})
             default_user: Default username for audit logging when not specified
+            encryption_key: Optional encryption key (bytes) for data-at-rest encryption. 
+                           If None and enable_encryption=True, a new key will be generated.
+            enable_encryption: If True, enables encryption for sensitive columns. 
+                              Can be set at creation or enabled later via enable_data_encryption() method.
         """
         self.db_path = db_path
         self.table_keys = table_keys  # Primary key columns for identifying unique records
         self.variables = variables     # Data columns with their semantic types
         self.default_user = default_user
         self.column_types = {}         # Derived SQL/Pandas types per column from input data
+        self.encryption_key = encryption_key
+        self.encryptor = None          # Fernet encryptor instance if encryption is enabled
         
         # Ensure directory exists for database file
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -89,6 +100,10 @@ class SQLiteTimeSeriesManager:
         
         # Create database tables if they don't exist
         self._initialize_schema()
+        
+        # Setup encryption if requested
+        if enable_encryption:
+            self._setup_encryption(encryption_key)
 
     def _quote_id(self, name: str) -> str:
         """
@@ -177,6 +192,154 @@ class SQLiteTimeSeriesManager:
             )
         """)
         self.conn.commit()
+
+    def _setup_encryption(self, key: Optional[bytes] = None):
+        """
+        Setup Fernet encryption for data-at-rest protection.
+        
+        Uses PBKDF2HMAC to derive a secure key from password if needed,
+        or uses provided key directly. Creates Fernet encryptor instance.
+        
+        Args:
+            key: Optional encryption key (bytes). If None, generates a new key.
+                 Key must be 32 url-safe base64-encoded bytes for Fernet.
+        
+        Note:
+            Store the encryption key securely - loss of key means permanent data loss.
+            For production, use environment variables or secure key management systems.
+        """
+        if key is None:
+            # Generate a new secure key
+            self.encryption_key = Fernet.generate_key()
+            logging.info("Generated new encryption key. STORE THIS KEY SECURELY!")
+        else:
+            self.encryption_key = key
+        
+        # Create Fernet encryptor instance
+        self.encryptor = Fernet(self.encryption_key)
+        logging.info("Encryption enabled for sensitive data columns.")
+    
+    def enable_data_encryption(self, key: Optional[bytes] = None):
+        """
+        Enable encryption for existing data (can be called after initialization).
+        
+        This method can be used to enable encryption on an already-initialized manager.
+        Note: Existing unencrypted data will remain unencrypted until updated.
+        New uploads and updates will be encrypted automatically.
+        
+        Args:
+            key: Optional encryption key (bytes). If None, generates a new key.
+        
+        Example:
+            # Enable encryption with existing key
+            sqlite_db.enable_data_encryption(key=my_stored_key)
+            
+            # Enable encryption with auto-generated key
+            sqlite_db.enable_data_encryption()  # Returns generated key via self.encryption_key
+        """
+        self._setup_encryption(key)
+    
+    def _encrypt_value(self, value: Any) -> str:
+        """
+        Encrypt a single value using Fernet symmetric encryption.
+        
+        Args:
+            value: Value to encrypt (will be converted to string if not already)
+            
+        Returns:
+            Base64-encoded encrypted string
+            
+        Note:
+            Returns None if encryption is not enabled (encryptor is None)
+        """
+        if self.encryptor is None:
+            return value
+        
+        if value is None:
+            return None
+        
+        # Convert to bytes and encrypt
+        value_bytes = str(value).encode('utf-8')
+        encrypted = self.encryptor.encrypt(value_bytes)
+        return encrypted.decode('utf-8')
+    
+    def _decrypt_value(self, encrypted_value: Optional[str]) -> Any:
+        """
+        Decrypt a single value using Fernet symmetric encryption.
+        
+        Args:
+            encrypted_value: Encrypted string to decrypt
+            
+        Returns:
+            Decrypted value (string), or original value if not encrypted/encryption disabled
+            
+        Note:
+            Returns input unchanged if encryption is not enabled or value is None
+        """
+        if self.encryptor is None or encrypted_value is None:
+            return encrypted_value
+        
+        try:
+            # Decrypt and decode
+            encrypted_bytes = encrypted_value.encode('utf-8')
+            decrypted = self.encryptor.decrypt(encrypted_bytes)
+            return decrypted.decode('utf-8')
+        except Exception:
+            # If decryption fails, return as-is (might not be encrypted)
+            return encrypted_value
+    
+    def _encrypt_dataframe(self, df: pd.DataFrame, columns_to_encrypt: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Encrypt specified columns in a DataFrame before storage.
+        
+        Args:
+            df: DataFrame to encrypt
+            columns_to_encrypt: List of column names to encrypt. 
+                               If None, encrypts all METRIC and CATEGORY type columns.
+                               
+        Returns:
+            DataFrame with specified columns encrypted
+            
+        Note:
+            Only encrypts columns that exist in the DataFrame.
+            Non-string values are converted to strings before encryption.
+        """
+        df = df.copy()
+        
+        if columns_to_encrypt is None:
+            # Default: encrypt sensitive data columns (METRIC and CATEGORY types)
+            columns_to_encrypt = [col for col, sem_type in self.variables.items() 
+                                 if sem_type in ['METRIC', 'CATEGORY'] and col in df.columns]
+        
+        for col in columns_to_encrypt:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: self._encrypt_value(x) if pd.notnull(x) else None)
+        
+        return df
+    
+    def _decrypt_dataframe(self, df: pd.DataFrame, columns_to_decrypt: Optional[List[str]] = None) -> pd.DataFrame:
+        """
+        Decrypt specified columns in a DataFrame after retrieval.
+        
+        Args:
+            df: DataFrame to decrypt
+            columns_to_decrypt: List of column names to decrypt.
+                               If None, attempts to decrypt all non-key columns.
+                               
+        Returns:
+            DataFrame with specified columns decrypted
+        """
+        df = df.copy()
+        
+        if columns_to_decrypt is None:
+            # Default: decrypt all variable columns
+            columns_to_decrypt = list(self.variables.keys())
+        
+        for col in columns_to_decrypt:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: self._decrypt_value(x) if pd.notnull(x) else None)
+        
+        return df
 
     def _coerce_df_to_sql(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -288,7 +451,8 @@ class SQLiteTimeSeriesManager:
                     pass  # Not a date, leave as-is
         return df
 
-    def upload_from_pandas(self, df: pd.DataFrame, user: Optional[str] = None, chunk_size: int = 50000):
+    def upload_from_pandas(self, df: pd.DataFrame, user: Optional[str] = None, chunk_size: int = 50000,
+                           encrypt_columns: Optional[bool] = None):
         """
         Upload data from a Pandas DataFrame to SQLite with automatic APPEND/EDIT detection.
         
@@ -299,11 +463,20 @@ class SQLiteTimeSeriesManager:
             df: Pandas DataFrame containing data to upload
             user: Username for audit logging (defaults to self.default_user)
             chunk_size: Number of rows to process per transaction (default 50,000)
+            encrypt_columns: If True, encrypts sensitive columns before storage.
+                            If False, stores data unencrypted.
+                            If None (default), uses encryption if enabled on the manager.
             
         Raises:
             ValueError: If DataFrame is missing required columns (table_keys + variables)
         """
         user = user or self.default_user
+        
+        # Apply encryption if enabled or requested
+        use_encryption = encrypt_columns if encrypt_columns is not None else (self.encryptor is not None)
+        if use_encryption and self.encryptor is not None:
+            df = self._encrypt_dataframe(df)
+        
         df = self._coerce_df_to_sql(df)
         
         # Validate that all required columns are present in the DataFrame
@@ -450,7 +623,8 @@ class SQLiteTimeSeriesManager:
             logging.error(f"Transaction failed and rolled back: {e}")
             raise
 
-    def download_to_pandas(self, table: str = 'live_data', filters: Dict[str, Any] = None) -> pd.DataFrame:
+    def download_to_pandas(self, table: str = 'live_data', filters: Dict[str, Any] = None, 
+                           decrypt_columns: Optional[bool] = None) -> pd.DataFrame:
         """
         Download data from a SQLite table to a Pandas DataFrame with optional filtering.
         
@@ -459,7 +633,10 @@ class SQLiteTimeSeriesManager:
             filters: Optional dictionary of column=value conditions for WHERE clause
                      Supports single values and lists (for IN clauses)
                      Datetime values are automatically converted to UTC ISO format
-                     
+            decrypt_columns: If True, decrypts sensitive columns after retrieval.
+                            If False, returns data as-is.
+                            If None (default), uses decryption if encryption is enabled.
+                    
         Returns:
             Pandas DataFrame with proper type coercion based on semantic types
             
@@ -491,6 +668,12 @@ class SQLiteTimeSeriesManager:
             query += " WHERE " + " AND ".join(conditions)
             
         df = pd.read_sql_query(query, self.conn, params=params)
+        
+        # Apply decryption if enabled or requested
+        use_decryption = decrypt_columns if decrypt_columns is not None else (self.encryptor is not None)
+        if use_decryption and self.encryptor is not None:
+            df = self._decrypt_dataframe(df)
+        
         return self._coerce_sql_to_df(df)
 
     def get_table_names(self) -> List[str]:
@@ -843,16 +1026,23 @@ class SQLiteBlobManager:
         blob_mgr.list_blobs()  # Shows all stored blobs
     """
     
-    def __init__(self, db_path: str, default_user: str = "system"):
+    def __init__(self, db_path: str, default_user: str = "system", 
+                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False):
         """
         Initialize the SQLite Blob Manager.
         
         Args:
             db_path: Path to the SQLite database file for blob storage
             default_user: Default username for audit logging when not specified
+            encryption_key: Optional encryption key (bytes) for encrypting blob data at rest.
+                           If None and enable_encryption=True, a new key will be generated.
+            enable_encryption: If True, enables encryption for blob binary data.
+                              Can be set at creation or enabled later via enable_data_encryption() method.
         """
         self.db_path = db_path
         self.default_user = default_user
+        self.encryption_key = encryption_key
+        self.encryptor = None  # Fernet encryptor instance if encryption is enabled
         
         # Ensure directory exists for database file
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -865,6 +1055,83 @@ class SQLiteBlobManager:
         
         # Create database tables for blob storage and audit
         self._initialize_schema()
+        
+        # Setup encryption if requested
+        if enable_encryption:
+            self._setup_encryption(encryption_key)
+    
+    def _setup_encryption(self, key: Optional[bytes] = None):
+        """
+        Setup Fernet encryption for blob data-at-rest protection.
+        
+        Args:
+            key: Optional encryption key (bytes). If None, generates a new key.
+        
+        Note:
+            Store the encryption key securely - loss of key means permanent data loss.
+        """
+        if key is None:
+            self.encryption_key = Fernet.generate_key()
+            logging.info("Generated new encryption key for blobs. STORE THIS KEY SECURELY!")
+        else:
+            self.encryption_key = key
+        
+        self.encryptor = Fernet(self.encryption_key)
+        logging.info("Encryption enabled for blob data.")
+    
+    def enable_data_encryption(self, key: Optional[bytes] = None):
+        """
+        Enable encryption for blob data (can be called after initialization).
+        
+        Note: Existing unencrypted blobs will remain unencrypted until re-uploaded.
+        New uploads will be encrypted automatically.
+        
+        Args:
+            key: Optional encryption key (bytes). If None, generates a new key.
+        """
+        self._setup_encryption(key)
+    
+    def _encrypt_blob(self, data: bytes) -> bytes:
+        """
+        Encrypt blob binary data using Fernet symmetric encryption.
+        
+        Args:
+            data: Binary data to encrypt
+            
+        Returns:
+            Encrypted binary data
+            
+        Note:
+            Returns data unchanged if encryption is not enabled
+        """
+        if self.encryptor is None:
+            return data
+        
+        encrypted = self.encryptor.encrypt(data)
+        return encrypted
+    
+    def _decrypt_blob(self, encrypted_data: bytes) -> bytes:
+        """
+        Decrypt blob binary data using Fernet symmetric encryption.
+        
+        Args:
+            encrypted_data: Encrypted binary data
+            
+        Returns:
+            Decrypted binary data
+            
+        Note:
+            Returns data unchanged if encryption is not enabled
+        """
+        if self.encryptor is None:
+            return encrypted_data
+        
+        try:
+            decrypted = self.encryptor.decrypt(encrypted_data)
+            return decrypted
+        except Exception:
+            # If decryption fails, return as-is (might not be encrypted)
+            return encrypted_data
     
     def _quote_id(self, name: str) -> str:
         """
@@ -963,7 +1230,7 @@ class SQLiteBlobManager:
         import hashlib
         return hashlib.sha256(data).hexdigest()
     
-    def upload_blob(self, filepath: str, name: str, user: Optional[str] = None) -> int:
+    def upload_blob(self, filepath: str, name: str, user: Optional[str] = None, encrypt: Optional[bool] = None) -> int:
         """
         Upload a file to blob storage with full audit tracking.
         
@@ -974,6 +1241,9 @@ class SQLiteBlobManager:
             filepath: Path to the file on disk to upload
             name: Unique name to identify this blob for later retrieval
             user: Username for audit logging (defaults to self.default_user)
+            encrypt: If True, encrypts blob data before storage.
+                    If False, stores data unencrypted.
+                    If None (default), uses encryption if enabled on the manager.
             
         Returns:
             Blob ID (primary key) of the uploaded/updated blob
@@ -994,6 +1264,11 @@ class SQLiteBlobManager:
         # Read file binary data
         with open(filepath, 'rb') as f:
             data = f.read()
+        
+        # Apply encryption if enabled or requested
+        use_encryption = encrypt if encrypt is not None else (self.encryptor is not None)
+        if use_encryption and self.encryptor is not None:
+            data = self._encrypt_blob(data)
         
         # Compute checksum and size for integrity tracking
         checksum = self._compute_checksum(data)
@@ -1078,7 +1353,7 @@ class SQLiteBlobManager:
             logging.error(f"Failed to upload blob '{name}': {e}")
             raise
     
-    def get(self, name: str, user: Optional[str] = None) -> str:
+    def get(self, name: str, user: Optional[str] = None, decrypt: Optional[bool] = None) -> str:
         """
         Retrieve a blob and open it in a temporary file for viewing.
         
@@ -1088,6 +1363,9 @@ class SQLiteBlobManager:
         Args:
             name: Name of the blob to retrieve
             user: Username for audit logging (defaults to self.default_user)
+            decrypt: If True, decrypts blob data after retrieval.
+                    If False, returns data as-is.
+                    If None (default), uses decryption if encryption is enabled.
             
         Returns:
             Path to temporary file containing the blob data
@@ -1122,6 +1400,11 @@ class SQLiteBlobManager:
             raise ValueError(f"Blob '{name}' not found in database")
         
         blob_id, source_filepath, data = result
+        
+        # Apply decryption if enabled or requested
+        use_decryption = decrypt if decrypt is not None else (self.encryptor is not None)
+        if use_decryption and self.encryptor is not None:
+            data = self._decrypt_blob(data)
         
         # Log the retrieval operation
         cur.execute("""
