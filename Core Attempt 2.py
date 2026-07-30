@@ -57,7 +57,7 @@ class SQLiteTimeSeriesManager:
     """
     
     # Default mapping of semantic types to their SQL and Pandas equivalents
-    # Used as fallback if type cannot be derived from input data
+    # Used ONLY when user explicitly provides custom type overrides via variables parameter
     TYPE_MAP = {
         'TIMESTAMP': {'sqlite': 'TEXT', 'pandas': 'datetime64[ns, UTC]'},
         'METRIC':    {'sqlite': 'REAL', 'pandas': 'float64'},
@@ -65,15 +65,25 @@ class SQLiteTimeSeriesManager:
         'ID':        {'sqlite': 'INTEGER', 'pandas': 'Int64'}
     }
 
-    def __init__(self, db_path: str, table_keys: List[str], variables: Dict[str, str], default_user: str = "system", 
-                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False, compress: bool = False):
+    def __init__(self, db_path: str, table_keys: List[str], variables: Optional[Dict[str, str]] = None, 
+                 default_user: str = "system", encryption_key: Optional[bytes] = None, 
+                 enable_encryption: bool = False, compress: bool = False,
+                 sample_data: Optional[pd.DataFrame] = None):
         """
         Initialize the SQLite Time Series Manager.
+        
+        Column Type Handling:
+        - PRIMARY METHOD: Automatic type inference from data (sample_data at init or first upload)
+        - OPTIONAL: Custom type overrides via variables parameter for fine-tuning
         
         Args:
             db_path: Path to the SQLite database file
             table_keys: List of column names that form the primary key (e.g., ['Date', 'Time Series'])
-            variables: Dictionary mapping column names to semantic types (e.g., {'Value': 'METRIC'})
+            variables: OPTIONAL - Dictionary mapping column names to semantic types for custom overrides.
+                      If None (default), types are inferred automatically from data.
+                      Use this only if you need to override inferred types.
+                      Example: {'Value': 'METRIC'} forces Value column to REAL/float64
+                      Example: {'Category': 'CATEGORY'} forces Category column to TEXT/string
             default_user: Default username for audit logging when not specified
             encryption_key: Optional encryption key (bytes) for data-at-rest encryption. 
                            If None and enable_encryption=True, a new key will be generated.
@@ -81,12 +91,16 @@ class SQLiteTimeSeriesManager:
                               Can be set at creation or enabled later via enable_data_encryption() method.
             compress: If True, runs VACUUM to compress/optimize the database after initialization.
                      Can also be called manually via compress_database() method.
+            sample_data: Optional DataFrame to infer column types from at initialization.
+                        If provided, column types will be dynamically derived from the actual 
+                        data types before schema creation. If not provided, types will be 
+                        inferred from the first uploaded DataFrame.
         """
         self.db_path = db_path
         self.table_keys = table_keys  # Primary key columns for identifying unique records
-        self.variables = variables     # Data columns with their semantic types
+        self.variables = variables or {}  # Custom type overrides (empty dict if None)
         self.default_user = default_user
-        self.column_types = {}         # Derived SQL/Pandas types per column from input data
+        self.column_types = {}         # Derived SQL/Pandas types per column from data inference
         self.encryption_key = encryption_key
         self.encryptor = None          # Fernet encryptor instance if encryption is enabled
         
@@ -99,6 +113,14 @@ class SQLiteTimeSeriesManager:
         self.conn.execute("PRAGMA journal_mode=WAL;")
         # Use NORMAL synchronous mode for balance between safety and performance
         self.conn.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Apply custom type overrides from variables parameter (if provided)
+        if self.variables:
+            self._apply_custom_type_overrides()
+        
+        # Infer column types from sample data if provided, before schema creation
+        if sample_data is not None:
+            self._infer_column_types_from_data(sample_data)
         
         # Create database tables if they don't exist
         self._initialize_schema()
@@ -123,6 +145,86 @@ class SQLiteTimeSeriesManager:
             Properly quoted identifier wrapped in double quotes
         """
         return f'"{name.replace("\"", "\"\"")}"'
+
+    def _apply_custom_type_overrides(self):
+        """
+        Apply custom type overrides from the variables parameter.
+        
+        This method converts semantic type specifications (e.g., 'METRIC', 'CATEGORY')
+        from the variables dict into SQL/Pandas type mappings. These overrides take
+        precedence over inferred types for the specified columns only.
+        
+        Use this when you want to force specific columns to use particular types
+        regardless of what the data inference would choose.
+        
+        Example:
+            variables={'Value': 'METRIC'} -> Value column forced to REAL/float64
+            variables={'ID': 'ID'} -> ID column forced to INTEGER/Int64
+        """
+        for col, sem_type in self.variables.items():
+            if sem_type in self.TYPE_MAP:
+                self.column_types[col] = self.TYPE_MAP[sem_type].copy()
+                logging.info(f"Applied custom type override for '{col}': {sem_type} -> {self.column_types[col]['sqlite']}")
+            else:
+                logging.warning(f"Unknown semantic type '{sem_type}' for column '{col}', using CATEGORY default")
+                self.column_types[col] = self.TYPE_MAP['CATEGORY'].copy()
+
+    def _infer_column_types_from_data(self, df: pd.DataFrame):
+        """
+        Infer optimal SQLite column types from Python/Pandas data types in a sample DataFrame.
+        
+        This is the PRIMARY method for determining column types. It analyzes the actual 
+        data types in the provided DataFrame and maps them to the most appropriate 
+        SQLite column types. This ensures the database schema matches the Python 
+        data types as closely as possible.
+        
+        Custom type overrides (from variables parameter) are preserved and not overwritten.
+        Only columns without custom overrides will have their types inferred.
+        
+        Type Inference Rules:
+        - datetime64[ns] or datetime64[ns, tz] -> TEXT (ISO format strings)
+        - float64, float32 -> REAL
+        - int64, int32, Int64 (nullable int) -> INTEGER
+        - bool -> INTEGER (SQLite stores booleans as 0/1)
+        - string, object, category -> TEXT
+        - timedelta64 -> TEXT (ISO format duration strings)
+        
+        Args:
+            df: Sample DataFrame containing the columns to infer types for
+        """
+        for col in df.columns:
+            # Skip columns with custom type overrides - preserve user's explicit choice
+            if col in self.variables and self.variables[col]:
+                logging.info(f"Skipping inference for '{col}' - custom override applied")
+                continue
+                
+            dtype = df[col].dtype
+            
+            # Determine SQLite type based on pandas dtype
+            if pd.api.types.is_datetime64_any_dtype(dtype):
+                sqlite_type = 'TEXT'
+                pandas_type = 'datetime64[ns, UTC]'
+            elif pd.api.types.is_float_dtype(dtype):
+                sqlite_type = 'REAL'
+                pandas_type = 'float64'
+            elif pd.api.types.is_integer_dtype(dtype):
+                sqlite_type = 'INTEGER'
+                pandas_type = 'Int64'
+            elif pd.api.types.is_bool_dtype(dtype):
+                sqlite_type = 'INTEGER'
+                pandas_type = 'boolean'
+            elif pd.api.types.is_timedelta64_dtype(dtype):
+                sqlite_type = 'TEXT'
+                pandas_type = 'timedelta64[ns]'
+            else:
+                # Default to TEXT for string-like types (object, string, category)
+                sqlite_type = 'TEXT'
+                pandas_type = 'string'
+            
+            # Store derived types for this column
+            self.column_types[col] = {'sqlite': sqlite_type, 'pandas': pandas_type}
+            
+            logging.info(f"Inferred column '{col}' type: {sqlite_type} (from pandas {dtype})")
 
     def _initialize_schema(self):
         """
@@ -158,15 +260,20 @@ class SQLiteTimeSeriesManager:
             )
         """)
 
-        # Build column definitions for historical data table based on table_keys and variables
-        # Uses derived column types if available, otherwise falls back to semantic type defaults
+        # Collect all columns that need type definitions (table_keys + variables)
+        all_columns = list(self.table_keys) + list(self.variables.keys())
+        
+        # Build column definitions for historical data table
+        # Priority: 1) Inferred types from data, 2) Custom overrides from variables, 3) Default TEXT
         hist_cols = []
-        for k in self.table_keys:
-            col_type = self.column_types.get(k, {}).get('sqlite', self.TYPE_MAP[self.variables.get(k, 'CATEGORY')]['sqlite'])
-            hist_cols.append(f"{self._quote_id(k)} {col_type}")
-        for v, t in self.variables.items():
-            col_type = self.column_types.get(v, {}).get('sqlite', self.TYPE_MAP[t]['sqlite'])
-            hist_cols.append(f"{self._quote_id(v)} {col_type}")
+        for col in all_columns:
+            if col in self.column_types:
+                # Use inferred or custom-specified type
+                col_type = self.column_types[col]['sqlite']
+            else:
+                # Fallback to TEXT for any column without type info
+                col_type = 'TEXT'
+            hist_cols.append(f"{self._quote_id(col)} {col_type}")
         hist_cols_str = ", ".join(hist_cols)
         
         # Create historical data table with full version history
@@ -179,14 +286,14 @@ class SQLiteTimeSeriesManager:
         """)
 
         # Build column definitions for live data table (current state)
-        # Uses derived column types if available, otherwise falls back to semantic type defaults
+        # Same type priority as historical_data
         live_cols = []
-        for k in self.table_keys:
-            col_type = self.column_types.get(k, {}).get('sqlite', self.TYPE_MAP[self.variables.get(k, 'CATEGORY')]['sqlite'])
-            live_cols.append(f"{self._quote_id(k)} {col_type}")
-        for v, t in self.variables.items():
-            col_type = self.column_types.get(v, {}).get('sqlite', self.TYPE_MAP[t]['sqlite'])
-            live_cols.append(f"{self._quote_id(v)} {col_type}")
+        for col in all_columns:
+            if col in self.column_types:
+                col_type = self.column_types[col]['sqlite']
+            else:
+                col_type = 'TEXT'
+            live_cols.append(f"{self._quote_id(col)} {col_type}")
         live_cols_str = ", ".join(live_cols)
         pk_str = ", ".join([self._quote_id(k) for k in self.table_keys])
         
@@ -313,9 +420,13 @@ class SQLiteTimeSeriesManager:
         df = df.copy()
         
         if columns_to_encrypt is None:
-            # Default: encrypt sensitive data columns (METRIC and CATEGORY types)
-            columns_to_encrypt = [col for col, sem_type in self.variables.items() 
-                                 if sem_type in ['METRIC', 'CATEGORY'] and col in df.columns]
+            # Default: encrypt all variable columns (user-specified custom overrides)
+            # If variables is empty, encrypt all non-key columns in the DataFrame
+            if self.variables:
+                columns_to_encrypt = [col for col in self.variables.keys() if col in df.columns]
+            else:
+                # Fallback: encrypt all columns that aren't table keys
+                columns_to_encrypt = [col for col in df.columns if col not in self.table_keys]
         
         for col in columns_to_encrypt:
             if col in df.columns:
@@ -404,8 +515,10 @@ class SQLiteTimeSeriesManager:
                 if getattr(df[col].dt, 'tz', None) is not None:
                     df[col] = df[col].dt.tz_convert('UTC')
                 df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-        # Replace NaN/NaT values with None for SQL NULL representation
-        df = df.where(pd.notnull(df), None)
+        
+        # Replace NaN/NaT/pd.NA values with None for SQL NULL representation
+        # Handle both numpy NaN and pandas NA types (for nullable dtypes like Int64)
+        df = df.map(lambda x: None if pd.isna(x) else x)
         return df
 
     def _coerce_sql_to_df(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -439,14 +552,17 @@ class SQLiteTimeSeriesManager:
                     df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
                 # 'string' type doesn't need conversion as it's already the default
         
-        # Fall back to semantic type mappings for columns without derived types
+        # Fall back to TYPE_MAP for columns with custom overrides but no inferred types
+        # This ensures custom-specified types are properly applied during data retrieval
         for col, sem_type in self.variables.items():
             if col not in df.columns:
                 continue
-            if sem_type == 'TIMESTAMP':
-                df[col] = pd.to_datetime(df[col], utc=True)
-            elif sem_type == 'METRIC':
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+            # Only use semantic type if column doesn't have inferred/custom type in column_types
+            if col not in self.column_types:
+                if sem_type == 'TIMESTAMP':
+                    df[col] = pd.to_datetime(df[col], utc=True)
+                elif sem_type == 'METRIC':
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
         
         # Try to parse table key columns as dates (e.g., 'Date' key might be a date string)
         for col in self.table_keys:
@@ -830,13 +946,16 @@ class DuckDBSyncManager:
         
         for col_name in all_columns:
             # Determine the appropriate DuckDB type for this column
+            # Priority: 1) Derived types from type_conversions, 2) Custom overrides, 3) Default VARCHAR
             if col_name in derived_types:
                 # Use derived column-specific type from type_conversions table
                 sqlite_type = derived_types[col_name]['sqlite']
+            elif col_name in self.sqlite_mgr.column_types:
+                # Use custom-specified type from variables parameter
+                sqlite_type = self.sqlite_mgr.column_types[col_name]['sqlite']
             else:
-                # Fall back to semantic type mapping
-                sem_type = self.sqlite_mgr.variables.get(col_name, 'CATEGORY')
-                sqlite_type = self.sqlite_mgr.TYPE_MAP.get(sem_type, self.sqlite_mgr.TYPE_MAP['CATEGORY'])['sqlite']
+                # Fallback to VARCHAR for any column without type info
+                sqlite_type = 'TEXT'
             
             # Map SQLite type to DuckDB type
             duckdb_type = self._map_sqlite_to_duckdb(sqlite_type, col_name)
@@ -1805,11 +1924,39 @@ import time
 # -----------------------------------------------------------------------------
 # Step 1: Initialize Class 1 (SQLite System of Record)
 # -----------------------------------------------------------------------------
-# Configure with your database path, primary key columns, and variable definitions
+# Column Type Handling:
+# - PRIMARY METHOD: Automatic type inference from data (no variables parameter needed)
+# - OPTIONAL CUSTOMIZATION: Use variables parameter only to override inferred types
+#
+# Example 1 - Automatic inference (recommended):
+#   sqlite_db = SQLiteTimeSeriesManager(
+#       db_path="timeseries.db",
+#       table_keys=["Date", "Time Series"],
+#       default_user="data_engineer"
+#   )
+#   # Types automatically inferred from first uploaded DataFrame
+#
+# Example 2 - With custom type overrides:
+#   sqlite_db = SQLiteTimeSeriesManager(
+#       db_path="timeseries.db",
+#       table_keys=["Date", "Time Series"],
+#       variables={"Value": "METRIC"},  # Force Value to REAL/float64
+#       default_user="data_engineer"
+#   )
+#
+# Example 3 - With sample data for early type inference:
+#   sample_df = pd.DataFrame({...})  # Your sample data
+#   sqlite_db = SQLiteTimeSeriesManager(
+#       db_path="timeseries.db",
+#       table_keys=["Date", "Time Series"],
+#       sample_data=sample_df,  # Infer types before schema creation
+#       default_user="data_engineer"
+#   )
+
 sqlite_db = SQLiteTimeSeriesManager(
     db_path=r"C:\Test\timeseries_operational.db",
     table_keys=["Date", "Time Series", "Organisation"],  # Composite primary key
-    variables={"Value": "METRIC"},                        # Data columns with types
+    variables={"Value": "METRIC"},                        # Optional: custom type override
     default_user="data_engineer"                          # Default audit user
 )
 
