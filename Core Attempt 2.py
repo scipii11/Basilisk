@@ -146,6 +146,21 @@ class SQLiteTimeSeriesManager:
         """
         return f'"{name.replace("\"", "\"\"")}"'
 
+    def _safe_escape_identifier(self, name: str) -> str:
+        """
+        Safely escape SQL identifiers to prevent injection and syntax errors.
+        This is an alias for _quote_id, provided for API compatibility.
+        
+        Args:
+            name: The column or table name to escape
+            
+        Returns:
+            Properly escaped identifier wrapped in double quotes
+        """
+        # Fix for the f-string backslash error: extract replacement to variable
+        escaped = name.replace('"', '""')
+        return f'"{escaped}"'
+
     def _apply_custom_type_overrides(self):
         """
         Apply custom type overrides from the variables parameter.
@@ -169,7 +184,7 @@ class SQLiteTimeSeriesManager:
                 logging.warning(f"Unknown semantic type '{sem_type}' for column '{col}', using CATEGORY default")
                 self.column_types[col] = self.TYPE_MAP['CATEGORY'].copy()
 
-    def _infer_column_types_from_data(self, df: pd.DataFrame):
+    def _infer_column_types_from_data(self, df: pd.DataFrame) -> Dict[str, str]:
         """
         Infer optimal SQLite column types from Python/Pandas data types in a sample DataFrame.
         
@@ -191,7 +206,11 @@ class SQLiteTimeSeriesManager:
         
         Args:
             df: Sample DataFrame containing the columns to infer types for
+            
+        Returns:
+            Dictionary mapping column names to SQLite types
         """
+        inferred_types = {}
         for col in df.columns:
             # Skip columns with custom type overrides - preserve user's explicit choice
             if col in self.variables and self.variables[col]:
@@ -201,7 +220,7 @@ class SQLiteTimeSeriesManager:
             dtype = df[col].dtype
             
             # Determine SQLite type based on pandas dtype
-            if pd.api.types.is_datetime64_any_dtype(dtype):
+            if 'datetime' in str(dtype) or 'date' in str(dtype):
                 sqlite_type = 'TEXT'
                 pandas_type = 'datetime64[ns, UTC]'
             elif pd.api.types.is_float_dtype(dtype):
@@ -223,8 +242,11 @@ class SQLiteTimeSeriesManager:
             
             # Store derived types for this column
             self.column_types[col] = {'sqlite': sqlite_type, 'pandas': pandas_type}
+            inferred_types[col] = sqlite_type
             
             logging.info(f"Inferred column '{col}' type: {sqlite_type} (from pandas {dtype})")
+        
+        return inferred_types
 
     def _initialize_schema(self):
         """
@@ -574,7 +596,8 @@ class SQLiteTimeSeriesManager:
         return df
 
     def upload_from_pandas(self, df: pd.DataFrame, user: Optional[str] = None, chunk_size: int = 50000,
-                           encrypt_columns: Optional[bool] = None):
+                           encrypt_columns: Optional[bool] = None, table_name: str = 'live_data', 
+                           primary_key: str = 'timestamp'):
         """
         Upload data from a Pandas DataFrame to SQLite with automatic APPEND/EDIT detection.
         
@@ -588,11 +611,34 @@ class SQLiteTimeSeriesManager:
             encrypt_columns: If True, encrypts sensitive columns before storage.
                             If False, stores data unencrypted.
                             If None (default), uses encryption if enabled on the manager.
+            table_name: Name of the table to upload to (default: 'live_data')
+            primary_key: Name of the primary key column (default: 'timestamp')
             
         Raises:
             ValueError: If DataFrame is missing required columns (table_keys + variables)
         """
         user = user or self.default_user
+        
+        # Determine types: Use user-provided overrides first, then infer from data
+        final_types = {}
+        
+        # 1. Start with user overrides
+        final_types.update(self.variables)
+        
+        # 2. Infer missing columns from the current dataframe
+        for col in df.columns:
+            if col not in final_types:
+                # Simple inference logic if not already defined
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    final_types[col] = 'TEXT'
+                elif pd.api.types.is_float_dtype(df[col]):
+                    final_types[col] = 'REAL'
+                elif pd.api.types.is_integer_dtype(df[col]):
+                    final_types[col] = 'INTEGER'
+                elif pd.api.types.is_bool_dtype(df[col]):
+                    final_types[col] = 'INTEGER'
+                else:
+                    final_types[col] = 'TEXT'
         
         # Apply encryption if enabled or requested
         use_encryption = encrypt_columns if encrypt_columns is not None else (self.encryptor is not None)
@@ -610,9 +656,10 @@ class SQLiteTimeSeriesManager:
         # Process data in chunks to handle large datasets efficiently
         for i in range(0, len(df), chunk_size):
             chunk = df.iloc[i:i+chunk_size]
-            self._process_chunk_atomic(chunk, user)
+            self._process_chunk_atomic(chunk, user, table_name, primary_key, final_types)
 
-    def _process_chunk_atomic(self, chunk: pd.DataFrame, user: str):
+    def _process_chunk_atomic(self, chunk: pd.DataFrame, user: str, table_name: str = 'live_data', 
+                               primary_key: str = 'timestamp', final_types: Optional[Dict[str, str]] = None):
         """
         Process a single chunk of data atomically within a transaction.
         
@@ -628,11 +675,24 @@ class SQLiteTimeSeriesManager:
         Args:
             chunk: DataFrame subset to process
             user: Username for audit logging
+            table_name: Name of the table to upload to (default: 'live_data')
+            primary_key: Name of the primary key column (default: 'timestamp')
+            final_types: Dictionary of column types for dynamic table creation (optional)
         """
         cur = self.conn.cursor()
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         
         try:
+            # Construct CREATE TABLE statement dynamically if final_types provided
+            if final_types is not None:
+                columns_def = [f"{self._quote_id(primary_key)} TEXT PRIMARY KEY"]
+                for col, dtype in final_types.items():
+                    if col != primary_key:
+                        columns_def.append(f"{self._quote_id(col)} {dtype}")
+                
+                create_sql = f"CREATE TABLE IF NOT EXISTS {self._quote_id(table_name)} ({', '.join(columns_def)})"
+                cur.execute(create_sql)
+            
             # BEGIN IMMEDIATE acquires write lock immediately, preventing concurrent writes
             cur.execute("BEGIN IMMEDIATE;")
             
@@ -643,7 +703,7 @@ class SQLiteTimeSeriesManager:
             flat_keys = [val for row in keys_in_chunk.values for val in row]
             
             quoted_keys = [self._quote_id(k) for k in self.table_keys]
-            query = f"SELECT * FROM live_data WHERE ({','.join(quoted_keys)}) IN ({in_clause})"
+            query = f"SELECT * FROM {self._quote_id(table_name)} WHERE ({','.join(quoted_keys)}) IN ({in_clause})"
             existing_df = pd.read_sql_query(query, self.conn, params=flat_keys)
             
             cols = self.table_keys + list(self.variables.keys())
