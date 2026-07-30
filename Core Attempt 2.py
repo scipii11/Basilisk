@@ -66,7 +66,7 @@ class SQLiteTimeSeriesManager:
     }
 
     def __init__(self, db_path: str, table_keys: List[str], variables: Dict[str, str], default_user: str = "system", 
-                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False):
+                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False, compress: bool = False):
         """
         Initialize the SQLite Time Series Manager.
         
@@ -79,6 +79,8 @@ class SQLiteTimeSeriesManager:
                            If None and enable_encryption=True, a new key will be generated.
             enable_encryption: If True, enables encryption for sensitive columns. 
                               Can be set at creation or enabled later via enable_data_encryption() method.
+            compress: If True, runs VACUUM to compress/optimize the database after initialization.
+                     Can also be called manually via compress_database() method.
         """
         self.db_path = db_path
         self.table_keys = table_keys  # Primary key columns for identifying unique records
@@ -104,6 +106,10 @@ class SQLiteTimeSeriesManager:
         # Setup encryption if requested
         if enable_encryption:
             self._setup_encryption(encryption_key)
+        
+        # Compress database if requested
+        if compress:
+            self.compress_database()
 
     def _quote_id(self, name: str) -> str:
         """
@@ -710,6 +716,29 @@ class SQLiteTimeSeriesManager:
             df = self._coerce_sql_to_df(df)
         return df
 
+    def compress_database(self):
+        """
+        Compress and optimize the SQLite database by running VACUUM.
+        
+        This reclaims unused space and defragments the database file.
+        Useful after bulk deletions or major data changes.
+        
+        Note:
+            - VACUUM rebuilds the entire database file
+            - Requires sufficient disk space (up to 2x database size temporarily)
+            - Cannot be run within a transaction
+            - For WAL mode, also checkpoints to ensure full optimization
+        """
+        try:
+            # Checkpoint WAL to ensure all changes are in main database before VACUUM
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            # Run VACUUM to reclaim space and optimize
+            self.conn.execute("VACUUM;")
+            logging.info("Database compression completed successfully.")
+        except Exception as e:
+            logging.error(f"Failed to compress database: {e}")
+            raise
+
     def close(self):
         """Close the SQLite database connection."""
         self.conn.close()
@@ -1027,7 +1056,7 @@ class SQLiteBlobManager:
     """
     
     def __init__(self, db_path: str, default_user: str = "system", 
-                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False):
+                 encryption_key: Optional[bytes] = None, enable_encryption: bool = False, compress: bool = False):
         """
         Initialize the SQLite Blob Manager.
         
@@ -1038,6 +1067,8 @@ class SQLiteBlobManager:
                            If None and enable_encryption=True, a new key will be generated.
             enable_encryption: If True, enables encryption for blob binary data.
                               Can be set at creation or enabled later via enable_data_encryption() method.
+            compress: If True, runs VACUUM to compress/optimize the database after initialization.
+                     Can also be called manually via compress_database() method.
         """
         self.db_path = db_path
         self.default_user = default_user
@@ -1059,6 +1090,10 @@ class SQLiteBlobManager:
         # Setup encryption if requested
         if enable_encryption:
             self._setup_encryption(encryption_key)
+        
+        # Compress database if requested
+        if compress:
+            self.compress_database()
     
     def _setup_encryption(self, key: Optional[bytes] = None):
         """
@@ -1535,6 +1570,29 @@ class SQLiteBlobManager:
         except Exception as e:
             self.conn.rollback()
             logging.error(f"Failed to delete blob '{name}': {e}")
+            raise
+    
+    def compress_database(self):
+        """
+        Compress and optimize the SQLite database by running VACUUM.
+        
+        This reclaims unused space and defragments the database file.
+        Useful after bulk deletions or major data changes.
+        
+        Note:
+            - VACUUM rebuilds the entire database file
+            - Requires sufficient disk space (up to 2x database size temporarily)
+            - Cannot be run within a transaction
+            - For WAL mode, also checkpoints to ensure full optimization
+        """
+        try:
+            # Checkpoint WAL to ensure all changes are in main database before VACUUM
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            # Run VACUUM to reclaim space and optimize
+            self.conn.execute("VACUUM;")
+            logging.info("Database compression completed successfully.")
+        except Exception as e:
+            logging.error(f"Failed to compress database: {e}")
             raise
     
     def close(self):
