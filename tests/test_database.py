@@ -242,9 +242,9 @@ class TestSQLiteDuckDBSync(unittest.TestCase):
         # Sync to DuckDB
         duckdb_mgr.sync()
         
-        # Query data from DuckDB
+        # Query data from DuckDB - use the actual primary key column name (ts) instead of timestamp
         duckdb_df = duckdb_mgr.conn.execute(
-            "SELECT * FROM analytics_live_data ORDER BY timestamp"
+            "SELECT * FROM analytics_live_data ORDER BY ts"
         ).fetchdf()
         
         # Verify row count matches
@@ -252,8 +252,8 @@ class TestSQLiteDuckDBSync(unittest.TestCase):
         
         # Verify data integrity
         pd.testing.assert_frame_equal(
-            df.sort_values('timestamp').reset_index(drop=True),
-            duckdb_df.drop(columns=['last_updated']).sort_values('timestamp').reset_index(drop=True),
+            df.sort_values('ts').reset_index(drop=True),
+            duckdb_df.drop(columns=['last_updated']).sort_values('ts').reset_index(drop=True),
             check_dtype=False
         )
         
