@@ -1,14 +1,30 @@
 ```
-# Python
-__pycache__/
+# Compiled Python files
 *.pyc
-*.pyo
-*.pyd
+__pycache__/
 
-# Test databases
+# Database files
+*.duckdb
+*.db
+
+# Test files
 tests/*.db
 tests/*.duckdb
 
-# Test cache
-tests/__pycache__/
+# Environment
+.env
+.env.local
+*.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+
+# OS specific
+.DS_Store
+Thumbs.db
 ```

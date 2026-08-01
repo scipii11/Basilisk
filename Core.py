@@ -28,11 +28,34 @@ import logging
 import os
 import tempfile
 import shutil
+import warnings
 from typing import List, Dict, Optional, Any
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
+
+
+# Custom exceptions for specific error scenarios
+class DatabaseError(Exception):
+    """Base exception for database operations."""
+    pass
+
+
+class SyncError(DatabaseError):
+    """Exception raised when sync operations between SQLite and DuckDB fail."""
+    pass
+
+
+class TypeConversionError(DatabaseError):
+    """Exception raised when type conversion fails during data transfer."""
+    pass
+
+
+class TransactionError(DatabaseError):
+    """Exception raised when transaction operations fail."""
+    pass
+
 
 # Configure logging for monitoring and debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -177,6 +200,11 @@ class SQLiteTimeSeriesManager:
             variables={'Value': 'METRIC'} -> Value column forced to REAL/float64
             variables={'ID': 'ID'} -> ID column forced to INTEGER/Int64
         """
+        # Guard clause: return early if no overrides provided
+        if not self.variables:
+            logging.debug("No custom type overrides to apply")
+            return
+            
         for col, sem_type in self.variables.items():
             if sem_type in self.TYPE_MAP:
                 self.column_types[col] = self.TYPE_MAP[sem_type].copy()
@@ -292,8 +320,9 @@ class SQLiteTimeSeriesManager:
             )
         """)
 
-        # Collect all columns that need type definitions (table_keys + variables)
-        all_columns = list(self.table_keys) + list(self.variables.keys())
+        # Collect ALL columns that have been inferred from data or specified via custom overrides
+        # This includes table_keys AND all other columns from sample_data inference
+        all_columns = list(self.column_types.keys())
         
         # Build column definitions for historical data table
         # Priority: 1) Inferred types from data, 2) Custom overrides from variables, 3) Default TEXT
@@ -662,7 +691,8 @@ class SQLiteTimeSeriesManager:
         df = self._coerce_df_to_sql(df)
         
         # Validate that all required columns are present in the DataFrame
-        required_cols = self.table_keys + list(self.variables.keys())
+        # Required columns include table_keys AND all other columns in the DataFrame
+        required_cols = self.table_keys + [col for col in df.columns if col not in self.table_keys]
         missing = set(required_cols) - set(df.columns)
         if missing:
             raise ValueError(f"Missing columns in DataFrame: {missing}")
@@ -720,7 +750,8 @@ class SQLiteTimeSeriesManager:
             query = f"SELECT * FROM {self._quote_id(table_name)} WHERE ({','.join(quoted_keys)}) IN ({in_clause})"
             existing_df = pd.read_sql_query(query, self.conn, params=flat_keys)
             
-            cols = self.table_keys + list(self.variables.keys())
+            # Get all columns from the chunk (table_keys + all other columns)
+            cols = list(chunk.columns)
             insert_cols = cols + ['last_updated']
             
             tx_records = []      # Audit log entries
@@ -732,7 +763,9 @@ class SQLiteTimeSeriesManager:
                 # Normalize numpy/Pandas scalar types to native Python types
                 # This prevents JSON serialization errors and ensures accurate value comparison
                 key_vals = {k: (row[k].item() if hasattr(row[k], 'item') else row[k]) for k in self.table_keys}
-                var_vals = {v: (row[v].item() if hasattr(row[v], 'item') else row[v]) for v in self.variables.keys()}
+                # Get all non-key column values for variable data
+                var_cols = [c for c in chunk.columns if c not in self.table_keys]
+                var_vals = {v: (row[v].item() if hasattr(row[v], 'item') else row[v]) for v in var_cols}
                 
                 # Find matching existing record by comparing primary key values
                 existing_row = existing_df[
@@ -741,7 +774,7 @@ class SQLiteTimeSeriesManager:
                 
                 if not existing_row.empty:
                     # Record exists - extract old values for audit trail
-                    old_vals = existing_row.iloc[0][list(self.variables.keys())].to_dict()
+                    old_vals = existing_row.iloc[0][var_cols].to_dict()
                     # Normalize old_vals to native Python types as well
                     old_vals = {k: (v.item() if hasattr(v, 'item') else v) for k, v in old_vals.items()}
                     
@@ -799,7 +832,12 @@ class SQLiteTimeSeriesManager:
             
             # Build UPSERT clause: insert new or update existing on conflict
             placeholders = ','.join(['?'] * len(insert_cols))
-            update_clause = ','.join([f"{self._quote_id(c)}=excluded.{self._quote_id(c)}" for c in self.variables.keys()]) + ", last_updated=excluded.last_updated"
+            
+            # Handle case where variables is empty - only update last_updated
+            if self.variables:
+                update_clause = ','.join([f"{self._quote_id(c)}=excluded.{self._quote_id(c)}" for c in self.variables.keys()]) + ", last_updated=excluded.last_updated"
+            else:
+                update_clause = "last_updated=excluded.last_updated"
             
             # Upsert into live_data: INSERT ... ON CONFLICT DO UPDATE (SQLite upsert pattern)
             cur.executemany(f"""
@@ -1020,16 +1058,18 @@ class DuckDBSyncManager:
         derived_types = {row[0]: {'sqlite': row[1], 'duckdb': row[2], 'pandas': row[3]} for row in type_rows}
         
         cols = []
-        all_columns = self.sqlite_mgr.table_keys + list(self.sqlite_mgr.variables.keys())
+        # Get ALL columns that have inferred or custom types from column_types dictionary
+        # This includes table_keys AND all other columns from sample_data inference
+        all_columns = list(self.sqlite_mgr.column_types.keys())
         
         for col_name in all_columns:
             # Determine the appropriate DuckDB type for this column
-            # Priority: 1) Derived types from type_conversions, 2) Custom overrides, 3) Default VARCHAR
+            # Priority: 1) Derived types from type_conversions, 2) Inferred/custom from column_types, 3) Default VARCHAR
             if col_name in derived_types:
                 # Use derived column-specific type from type_conversions table
                 duckdb_type = derived_types[col_name]['duckdb']
             elif col_name in self.sqlite_mgr.column_types:
-                # Use custom-specified type from variables parameter
+                # Use inferred or custom-specified type from column_types
                 duckdb_type = self.sqlite_mgr.column_types[col_name]['duckdb']
             else:
                 # Fallback to VARCHAR for any column without type info
@@ -1123,14 +1163,17 @@ class DuckDBSyncManager:
                 # Upsert data into DuckDB analytics table using INSERT OR REPLACE
                 # This handles both new records (INSERT) and updated records (REPLACE)
                 # Types are preserved through the explicit type conversion above
+                # Explicitly specify columns to avoid column count mismatch
+                cols_to_insert = [c for c in df_live.columns if c != 'index']  # Exclude any index column
+                cols_quoted = ', '.join([self._quote_id(c) for c in cols_to_insert])
                 self.conn.execute(f"""
-                    INSERT OR REPLACE INTO analytics_live_data 
-                    SELECT * FROM df_live
+                    INSERT OR REPLACE INTO analytics_live_data ({cols_quoted})
+                    SELECT {cols_quoted} FROM df_live
                 """)
 
         # Update sync metadata with the highest transaction ID processed
         # This ensures next sync only processes newer transactions
-        max_tx_id = new_txs['tx_id'].max()
+        max_tx_id = int(new_txs['tx_id'].max())  # Convert numpy.int64 to native Python int
         self.conn.execute("UPDATE _sync_metadata SET value = ? WHERE key='last_synced_tx_id'", [max_tx_id])
         logging.info(f"Sync complete. Updated to tx_id {max_tx_id}.")
 
