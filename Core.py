@@ -58,11 +58,12 @@ class SQLiteTimeSeriesManager:
     
     # Default mapping of semantic types to their SQL and Pandas equivalents
     # Used ONLY when user explicitly provides custom type overrides via variables parameter
+    # This mapping is database-agnostic and applies to both SQLite and DuckDB
     TYPE_MAP = {
-        'TIMESTAMP': {'sqlite': 'TEXT', 'pandas': 'datetime64[ns, UTC]'},
-        'METRIC':    {'sqlite': 'REAL', 'pandas': 'float64'},
-        'CATEGORY':  {'sqlite': 'TEXT', 'pandas': 'string'},
-        'ID':        {'sqlite': 'INTEGER', 'pandas': 'Int64'}
+        'TIMESTAMP': {'sqlite': 'TEXT', 'duckdb': 'TIMESTAMP', 'pandas': 'datetime64[ns, UTC]'},
+        'METRIC':    {'sqlite': 'REAL', 'duckdb': 'DOUBLE',   'pandas': 'float64'},
+        'CATEGORY':  {'sqlite': 'TEXT', 'duckdb': 'VARCHAR',  'pandas': 'string'},
+        'ID':        {'sqlite': 'INTEGER', 'duckdb': 'BIGINT', 'pandas': 'Int64'}
     }
 
     def __init__(self, db_path: str, table_keys: List[str], variables: Optional[Dict[str, str]] = None, 
@@ -219,29 +220,35 @@ class SQLiteTimeSeriesManager:
                 
             dtype = df[col].dtype
             
-            # Determine SQLite type based on pandas dtype
+            # Determine database-agnostic types based on pandas dtype
             if 'datetime' in str(dtype) or 'date' in str(dtype):
                 sqlite_type = 'TEXT'
+                duckdb_type = 'TIMESTAMP'
                 pandas_type = 'datetime64[ns, UTC]'
             elif pd.api.types.is_float_dtype(dtype):
                 sqlite_type = 'REAL'
+                duckdb_type = 'DOUBLE'
                 pandas_type = 'float64'
             elif pd.api.types.is_integer_dtype(dtype):
                 sqlite_type = 'INTEGER'
+                duckdb_type = 'BIGINT'
                 pandas_type = 'Int64'
             elif pd.api.types.is_bool_dtype(dtype):
                 sqlite_type = 'INTEGER'
+                duckdb_type = 'BOOLEAN'
                 pandas_type = 'boolean'
             elif pd.api.types.is_timedelta64_dtype(dtype):
                 sqlite_type = 'TEXT'
+                duckdb_type = 'INTERVAL'
                 pandas_type = 'timedelta64[ns]'
             else:
                 # Default to TEXT for string-like types (object, string, category)
                 sqlite_type = 'TEXT'
+                duckdb_type = 'VARCHAR'
                 pandas_type = 'string'
             
-            # Store derived types for this column
-            self.column_types[col] = {'sqlite': sqlite_type, 'pandas': pandas_type}
+            # Store derived types for this column (database-agnostic)
+            self.column_types[col] = {'sqlite': sqlite_type, 'duckdb': duckdb_type, 'pandas': pandas_type}
             inferred_types[col] = sqlite_type
             
             logging.info(f"Inferred column '{col}' type: {sqlite_type} (from pandas {dtype})")
@@ -260,17 +267,20 @@ class SQLiteTimeSeriesManager:
         """
         cur = self.conn.cursor()
         
-        # Create type conversion reference table for consistent type handling
-        # Stores both semantic type mappings and column-specific derived types
+        # Create type conversion reference table for consistent type handling across SQLite and DuckDB
+        # Stores semantic type mappings with database-specific types (sqlite_type, duckdb_type, pandas_type)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS type_conversions (
-                semantic_type TEXT PRIMARY KEY, sqlite_type TEXT, python_type TEXT
+                semantic_type TEXT PRIMARY KEY, 
+                sqlite_type TEXT, 
+                duckdb_type TEXT,
+                pandas_type TEXT
             )
         """)
-        # Populate default type conversions from TYPE_MAP
+        # Populate default type conversions from TYPE_MAP (shared between databases)
         for sem_type, mapping in self.TYPE_MAP.items():
-            cur.execute("INSERT OR IGNORE INTO type_conversions VALUES (?, ?, ?)", 
-                        (sem_type, mapping['sqlite'], mapping['pandas']))
+            cur.execute("INSERT OR IGNORE INTO type_conversions VALUES (?, ?, ?, ?)", 
+                        (sem_type, mapping['sqlite'], mapping['duckdb'], mapping['pandas']))
 
         # Create transaction log table for audit trail
         # Records: who made the change, when, what operation, which keys, old/new values, status
@@ -507,28 +517,32 @@ class SQLiteTimeSeriesManager:
             if col not in self.column_types:
                 dtype = df[col].dtype
                 
-                # Determine semantic type based on pandas dtype
+                # Determine database-agnostic types based on pandas dtype
                 if pd.api.types.is_datetime64_any_dtype(dtype):
                     sqlite_type = 'TEXT'
+                    duckdb_type = 'TIMESTAMP'
                     pandas_type = 'datetime64[ns, UTC]'
                 elif pd.api.types.is_float_dtype(dtype):
                     sqlite_type = 'REAL'
+                    duckdb_type = 'DOUBLE'
                     pandas_type = 'float64'
                 elif pd.api.types.is_integer_dtype(dtype):
                     sqlite_type = 'INTEGER'
+                    duckdb_type = 'BIGINT'
                     pandas_type = 'Int64'
                 else:
                     sqlite_type = 'TEXT'
+                    duckdb_type = 'VARCHAR'
                     pandas_type = 'string'
                 
-                # Store derived types for this column
-                self.column_types[col] = {'sqlite': sqlite_type, 'pandas': pandas_type}
+                # Store derived types for this column (database-agnostic)
+                self.column_types[col] = {'sqlite': sqlite_type, 'duckdb': duckdb_type, 'pandas': pandas_type}
                 
                 # Update type_conversions table with derived column-specific types
                 # Use column name as semantic_type key for column-specific mappings
                 cur = self.conn.cursor()
-                cur.execute("INSERT OR REPLACE INTO type_conversions VALUES (?, ?, ?)",
-                           (col, sqlite_type, pandas_type))
+                cur.execute("INSERT OR REPLACE INTO type_conversions VALUES (?, ?, ?, ?)",
+                           (col, sqlite_type, duckdb_type, pandas_type))
                 self.conn.commit()
         
         for col in df.columns:
@@ -990,16 +1004,20 @@ class DuckDBSyncManager:
         - last_updated timestamp column
         
         Type mapping process:
-        1. First checks SQLite's type_conversions table for column-specific derived types
-        2. Falls back to semantic type mappings if column-specific types not found
-        3. Maps SQLite types to equivalent DuckDB types for accurate type preservation
+        1. First checks SQLite's type_conversions table for column-specific derived types (sqlite_type, duckdb_type, pandas_type)
+        2. Falls back to in-memory column_types if not in type_conversions
+        3. Defaults to VARCHAR for any column without type info
+        
+        The type_conversions table stores database-agnostic type mappings that are shared
+        between SQLite and DuckDB, ensuring consistent type handling when moving data
+        between databases or to/from pandas DataFrames.
         """
         # Build column definitions using DuckDB type mappings
         # First, try to get derived types from SQLite's type_conversions table
         cur = self.sqlite_mgr.conn.cursor()
-        cur.execute("SELECT semantic_type, sqlite_type, python_type FROM type_conversions")
+        cur.execute("SELECT semantic_type, sqlite_type, duckdb_type, pandas_type FROM type_conversions")
         type_rows = cur.fetchall()
-        derived_types = {row[0]: {'sqlite': row[1], 'pandas': row[2]} for row in type_rows}
+        derived_types = {row[0]: {'sqlite': row[1], 'duckdb': row[2], 'pandas': row[3]} for row in type_rows}
         
         cols = []
         all_columns = self.sqlite_mgr.table_keys + list(self.sqlite_mgr.variables.keys())
@@ -1009,16 +1027,14 @@ class DuckDBSyncManager:
             # Priority: 1) Derived types from type_conversions, 2) Custom overrides, 3) Default VARCHAR
             if col_name in derived_types:
                 # Use derived column-specific type from type_conversions table
-                sqlite_type = derived_types[col_name]['sqlite']
+                duckdb_type = derived_types[col_name]['duckdb']
             elif col_name in self.sqlite_mgr.column_types:
                 # Use custom-specified type from variables parameter
-                sqlite_type = self.sqlite_mgr.column_types[col_name]['sqlite']
+                duckdb_type = self.sqlite_mgr.column_types[col_name]['duckdb']
             else:
                 # Fallback to VARCHAR for any column without type info
-                sqlite_type = 'TEXT'
+                duckdb_type = 'VARCHAR'
             
-            # Map SQLite type to DuckDB type
-            duckdb_type = self._map_sqlite_to_duckdb(sqlite_type, col_name)
             cols.append(f"{self._quote_id(col_name)} {duckdb_type}")
         
         cols_str = ", ".join(cols)
@@ -1031,29 +1047,6 @@ class DuckDBSyncManager:
                 PRIMARY KEY ({pk_str})
             )
         """)
-
-    def _map_sqlite_to_duckdb(self, sqlite_type: str, col_name: str) -> str:
-        """
-        Map SQLite column type to equivalent DuckDB type.
-        
-        Args:
-            sqlite_type: The SQLite column type (e.g., 'TEXT', 'REAL', 'INTEGER')
-            col_name: Column name for context (used in error messages)
-            
-        Returns:
-            Equivalent DuckDB type string
-            
-        Note:
-            This ensures type consistency when syncing data between SQLite and DuckDB.
-        """
-        # Map common SQLite types to DuckDB equivalents
-        type_mapping = {
-            'TEXT': 'VARCHAR',
-            'REAL': 'DOUBLE',
-            'INTEGER': 'BIGINT',
-            'NUMERIC': 'DECIMAL'
-        }
-        return type_mapping.get(sqlite_type, 'VARCHAR')  # Default to VARCHAR for unknown types
 
     def sync(self):
         """
@@ -1975,170 +1968,181 @@ class DuckDBBlobSyncManager:
 # This section demonstrates the typical workflow for using the dual-database
 # architecture. In production, you would import the classes and use them
 # separately in your application code.
-        
-import pandas as pd
-import numpy as np
-from RBNZ_Toolbox import ffs
-import time
 
-# -----------------------------------------------------------------------------
-# Step 1: Initialize Class 1 (SQLite System of Record)
-# -----------------------------------------------------------------------------
-# Column Type Handling:
-# - PRIMARY METHOD: Automatic type inference from data (no variables parameter needed)
-# - OPTIONAL CUSTOMIZATION: Use variables parameter only to override inferred types
-#
-# Example 1 - Automatic inference (recommended):
-#   sqlite_db = SQLiteTimeSeriesManager(
-#       db_path="timeseries.db",
-#       table_keys=["Date", "Time Series"],
-#       default_user="data_engineer"
-#   )
-#   # Types automatically inferred from first uploaded DataFrame
-#
-# Example 2 - With custom type overrides:
-#   sqlite_db = SQLiteTimeSeriesManager(
-#       db_path="timeseries.db",
-#       table_keys=["Date", "Time Series"],
-#       variables={"Value": "METRIC"},  # Force Value to REAL/float64
-#       default_user="data_engineer"
-#   )
-#
-# Example 3 - With sample data for early type inference:
-#   sample_df = pd.DataFrame({...})  # Your sample data
-#   sqlite_db = SQLiteTimeSeriesManager(
-#       db_path="timeseries.db",
-#       table_keys=["Date", "Time Series"],
-#       sample_data=sample_df,  # Infer types before schema creation
-#       default_user="data_engineer"
-#   )
-
-sqlite_db = SQLiteTimeSeriesManager(
-    db_path=r"C:\Test\timeseries_operational.db",
-    table_keys=["Date", "Time Series", "Organisation"],  # Composite primary key
-    variables={"Value": "METRIC"},                        # Optional: custom type override
-    default_user="data_engineer"                          # Default audit user
-)
-
-# -----------------------------------------------------------------------------
-# Step 2: Initialize Class 2 (DuckDB Analytical Layer)
-# -----------------------------------------------------------------------------
-# DuckDB syncs from SQLite - pass the SQLite manager instance
-duckdb_manager = DuckDBSyncManager(
-    duckdb_path=r"C:\Test\timeseries_analytics.duckdb",
-    sqlite_manager=sqlite_db
-)
-
-# --- SCENARIO 1: User uploads new data via Pandas ---
-print("\n--- Uploading Data via Pandas ---")
-# Create dummy data (in real usage, this would come from your data source)
-dates = pd.date_range("2023-10-01", periods=5, freq='D', tz='UTC')
-df_upload = ffs.get('LVRN.MMb1.AA', release_date='2024-08-30')
-
-# Upload to SQLite - automatically detects APPEND vs EDIT based on primary key
-# Records are written to both live_data and historical_data with full audit trail
-sqlite_db.upload_from_pandas(df_upload, user="analyst_1")
-
-# --- SCENARIO 2: User edits existing data ---
-print("\n--- Editing Data via Pandas ---")
-time.sleep(10)  # Simulate time passing between operations
-df_edit = ffs.get('LVRN.MMB1.AA')
-# Same method handles EDITs automatically - compares old vs new values
-sqlite_db.upload_from_pandas(df_edit, user="analyst_3")
-
-df_upload['Status'] = 'Active'
-sqlite_db.upload_from_pandas(df_upload, user="analyst_4")
-
-df_edit.iloc[-1, -1] = 100  # Modify a value to demonstrate edit detection
-
-t = sqlite_db.download_to_pandas()
-
-# --- SCENARIO 3: Sync changes to DuckDB analytical layer ---
-print("\n--- Syncing to DuckDB ---")
-# Incremental sync - only processes transactions since last sync point
-# Efficient for large datasets with frequent small updates
-duckdb_manager.sync()
-
-# --- SCENARIO 4: Query analytics layer with filters ---
-print("\n--- Downloading Live State to Pandas ---")
-# Fast analytical queries against DuckDB with optional filtering
-df_live = duckdb_manager.get()
-print(df_live)
-
-# Example filtered query (uncomment to use):
-# df_filtered = duckdb_manager.get(Date='2024-01-01', Organisation=['RBNZ'])
-
-# -----------------------------------------------------------------------------
-# Step 3: Initialize Class 3 (SQLite Blob Manager for Binary Files)
-# -----------------------------------------------------------------------------
-# Manages storage and retrieval of binary files with full audit trail
-blob_mgr = SQLiteBlobManager(
-    db_path=r"C:\Test\blobs.db",
-    default_user="data_engineer"
-)
-
-# --- SCENARIO 5: Upload a blob (e.g., PDF report, image, etc.) ---
-print("\n--- Uploading Blob ---")
-# Create a test file for demonstration
-test_file = r"C:\Test\test_document.pdf"
-os.makedirs(os.path.dirname(test_file), exist_ok=True)
-with open(test_file, 'wb') as f:
-    f.write(b"%PDF-1.4 Test PDF content for demonstration")
-
-# Upload blob with unique name for recall
-blob_id = blob_mgr.upload_blob(test_file, name="quarterly_report_q3_2024", user="analyst_1")
-print(f"Uploaded blob with ID: {blob_id}")
-
-# --- SCENARIO 6: List all stored blobs ---
-print("\n--- Listing Blobs ---")
-blobs_df = blob_mgr.list_blobs()
-print(blobs_df)
-
-# --- SCENARIO 7: Retrieve blob - opens in temp file for viewing ---
-print("\n--- Retrieving Blob ---")
-temp_path = blob_mgr.get("quarterly_report_q3_2024", user="analyst_2")
-print(f"Blob opened in temp file: {temp_path}")
-# In real usage, you could open it: os.startfile(temp_path)  # Windows
-# Or read the content: with open(temp_path, 'rb') as f: data = f.read()
-# Cleanup temp file after use: os.remove(temp_path)
-
-# --- SCENARIO 8: View audit log for blob operations ---
-print("\n--- Blob Audit Log ---")
-audit_df = blob_mgr.get_audit_log()
-print(audit_df)
-
-# --- SCENARIO 9: Delete a blob ---
-# Uncomment to test deletion:
-# blob_mgr.delete_blob("quarterly_report_q3_2024", user="analyst_1")
-
-# Cleanup
-# blob_mgr.close()
-
-# -----------------------------------------------------------------------------
-# Step 4: Initialize Class 4 (DuckDB Blob Sync Manager for Analytics)
-# -----------------------------------------------------------------------------
-# Syncs blob metadata to DuckDB for analytical queries
-blob_sync = DuckDBBlobSyncManager(
-    duckdb_path=r"C:\Test\blob_analytics.duckdb",
-    blob_manager=blob_mgr
-)
-
-# --- SCENARIO 10: Sync blob metadata to DuckDB ---
-print("\n--- Syncing Blob Metadata to DuckDB ---")
-blob_sync.sync()
-
-# --- SCENARIO 11: Query blob analytics ---
-print("\n--- Querying Blob Analytics ---")
-analytics_df = blob_sync.get()
-print(analytics_df)
-
-# Example filtered query:
-# filtered = blob_sync.get(uploaded_by='analyst_1')
-
-# Cleanup
-# blob_sync.close()
-
-# Cleanup (uncomment in production to properly close connections)
-# sqlite_db.close()
+if __name__ == "__main__":
+    import pandas as pd
+    import numpy as np
+    import time
+    
+    # Helper function for pretty formatting (replaces RBNZ_Toolbox.ffs)
+    def ffs(value, decimals=1):
+        """Format number with commas and specified decimal places."""
+        if value is None or pd.isna(value):
+            return ""
+        try:
+            return f"{float(value):,.{decimals}f}"
+        except (ValueError, TypeError):
+            return str(value)
+    
+    # -----------------------------------------------------------------------------
+    # Step 1: Initialize Class 1 (SQLite System of Record)
+    # -----------------------------------------------------------------------------
+    # Column Type Handling:
+    # - PRIMARY METHOD: Automatic type inference from data (no variables parameter needed)
+    # - OPTIONAL CUSTOMIZATION: Use variables parameter only to override inferred types
+    #
+    # Example 1 - Automatic inference (recommended):
+    #   sqlite_db = SQLiteTimeSeriesManager(
+    #       db_path="timeseries.db",
+    #       table_keys=["Date", "Time Series"],
+    #       default_user="data_engineer"
+    #   )
+    #   # Types automatically inferred from first uploaded DataFrame
+    #
+    # Example 2 - With custom type overrides:
+    #   sqlite_db = SQLiteTimeSeriesManager(
+    #       db_path="timeseries.db",
+    #       table_keys=["Date", "Time Series"],
+    #       variables={"Value": "METRIC"},  # Force Value to REAL/float64
+    #       default_user="data_engineer"
+    #   )
+    #
+    # Example 3 - With sample data for early type inference:
+    #   sample_df = pd.DataFrame({...})  # Your sample data
+    #   sqlite_db = SQLiteTimeSeriesManager(
+    #       db_path="timeseries.db",
+    #       table_keys=["Date", "Time Series"],
+    #       sample_data=sample_df,  # Infer types before schema creation
+    #       default_user="data_engineer"
+    #   )
+    
+    sqlite_db = SQLiteTimeSeriesManager(
+        db_path=r"C:\Test\timeseries_operational.db",
+        table_keys=["Date", "Time Series", "Organisation"],  # Composite primary key
+        variables={"Value": "METRIC"},                        # Optional: custom type override
+        default_user="data_engineer"                          # Default audit user
+    )
+    
+    # -----------------------------------------------------------------------------
+    # Step 2: Initialize Class 2 (DuckDB Analytical Layer)
+    # -----------------------------------------------------------------------------
+    # DuckDB syncs from SQLite - pass the SQLite manager instance
+    duckdb_manager = DuckDBSyncManager(
+        duckdb_path=r"C:\Test\timeseries_analytics.duckdb",
+        sqlite_manager=sqlite_db
+    )
+    
+    # --- SCENARIO 1: User uploads new data via Pandas ---
+    print("\n--- Uploading Data via Pandas ---")
+    # Create dummy data (in real usage, this would come from your data source)
+    dates = pd.date_range("2023-10-01", periods=5, freq='D', tz='UTC')
+    df_upload = ffs.get('LVRN.MMb1.AA', release_date='2024-08-30')
+    
+    # Upload to SQLite - automatically detects APPEND vs EDIT based on primary key
+    # Records are written to both live_data and historical_data with full audit trail
+    sqlite_db.upload_from_pandas(df_upload, user="analyst_1")
+    
+    # --- SCENARIO 2: User edits existing data ---
+    print("\n--- Editing Data via Pandas ---")
+    time.sleep(10)  # Simulate time passing between operations
+    df_edit = ffs.get('LVRN.MMB1.AA')
+    # Same method handles EDITs automatically - compares old vs new values
+    sqlite_db.upload_from_pandas(df_edit, user="analyst_3")
+    
+    # Additional scenario: Add Status column and upload
+    df_upload['Status'] = 'Active'
+    sqlite_db.upload_from_pandas(df_upload, user="analyst_4")
+    
+    df_edit.iloc[-1, -1] = 100  # Modify a value to demonstrate edit detection
+    
+    t = sqlite_db.download_to_pandas()
+    
+    # --- SCENARIO 3: Sync changes to DuckDB analytical layer ---
+    print("\n--- Syncing to DuckDB ---")
+    # Incremental sync - only processes transactions since last sync point
+    # Efficient for large datasets with frequent small updates
+    duckdb_manager.sync()
+    
+    # --- SCENARIO 4: Query analytics layer with filters ---
+    print("\n--- Downloading Live State to Pandas ---")
+    # Fast analytical queries against DuckDB with optional filtering
+    df_live = duckdb_manager.get()
+    print(df_live)
+    
+    # Example filtered query (uncomment to use):
+    # df_filtered = duckdb_manager.get(Date='2024-01-01', Organisation=['RBNZ'])
+    
+    # -----------------------------------------------------------------------------
+    # Step 3: Initialize Class 3 (SQLite Blob Manager for Binary Files)
+    # -----------------------------------------------------------------------------
+    # Manages storage and retrieval of binary files with full audit trail
+    blob_mgr = SQLiteBlobManager(
+        db_path=r"C:\Test\blobs.db",
+        default_user="data_engineer"
+    )
+    
+    # --- SCENARIO 5: Upload a blob (e.g., PDF report, image, etc.) ---
+    print("\n--- Uploading Blob ---")
+    # Create a test file for demonstration
+    test_file = r"C:\Test\test_document.pdf"
+    os.makedirs(os.path.dirname(test_file), exist_ok=True)
+    with open(test_file, 'wb') as f:
+        f.write(b"%PDF-1.4 Test PDF content for demonstration")
+    
+    # Upload blob with unique name for recall
+    blob_id = blob_mgr.upload_blob(test_file, name="quarterly_report_q3_2024", user="analyst_1")
+    print(f"Uploaded blob with ID: {blob_id}")
+    
+    # --- SCENARIO 6: List all stored blobs ---
+    print("\n--- Listing Blobs ---")
+    blobs_df = blob_mgr.list_blobs()
+    print(blobs_df)
+    
+    # --- SCENARIO 7: Retrieve blob - opens in temp file for viewing ---
+    print("\n--- Retrieving Blob ---")
+    temp_path = blob_mgr.get("quarterly_report_q3_2024", user="analyst_2")
+    print(f"Blob opened in temp file: {temp_path}")
+    # In real usage, you could open it: os.startfile(temp_path)  # Windows
+    # Or read the content: with open(temp_path, 'rb') as f: data = f.read()
+    # Cleanup temp file after use: os.remove(temp_path)
+    
+    # --- SCENARIO 8: View audit log for blob operations ---
+    print("\n--- Blob Audit Log ---")
+    audit_df = blob_mgr.get_audit_log()
+    print(audit_df)
+    
+    # --- SCENARIO 9: Delete a blob ---
+    # Uncomment to test deletion:
+    # blob_mgr.delete_blob("quarterly_report_q3_2024", user="analyst_1")
+    
+    # Cleanup
+    # blob_mgr.close()
+    
+    # -----------------------------------------------------------------------------
+    # Step 4: Initialize Class 4 (DuckDB Blob Sync Manager for Analytics)
+    # -----------------------------------------------------------------------------
+    # Syncs blob metadata to DuckDB for analytical queries
+    blob_sync = DuckDBBlobSyncManager(
+        duckdb_path=r"C:\Test\blob_analytics.duckdb",
+        blob_manager=blob_mgr
+    )
+    
+    # --- SCENARIO 10: Sync blob metadata to DuckDB ---
+    print("\n--- Syncing Blob Metadata to DuckDB ---")
+    blob_sync.sync()
+    
+    # --- SCENARIO 11: Query blob analytics ---
+    print("\n--- Querying Blob Analytics ---")
+    analytics_df = blob_sync.get()
+    print(analytics_df)
+    
+    # Example filtered query:
+    # filtered = blob_sync.get(uploaded_by='analyst_1')
+    
+    # Cleanup
+    # blob_sync.close()
+    
+    # Cleanup (uncomment in production to properly close connections)
+    # sqlite_db.close()
 # duckdb_manager.close()
 # duckdb_manager.close()
