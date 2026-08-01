@@ -2046,7 +2046,12 @@ df_edit = ffs.get('LVRN.MMB1.AA')
 # Same method handles EDITs automatically - compares old vs new values
 sqlite_db.upload_from_pandas(df_edit, user="analyst_3")
 
+df_upload['Status'] = 'Active'
+sqlite_db.upload_from_pandas(df_upload, user="analyst_4")
+
 df_edit.iloc[-1, -1] = 100  # Modify a value to demonstrate edit detection
+
+t = sqlite_db.download_to_pandas()
 
 # --- SCENARIO 3: Sync changes to DuckDB analytical layer ---
 print("\n--- Syncing to DuckDB ---")

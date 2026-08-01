@@ -25,14 +25,14 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem, 
                              QTabWidget, QMessageBox, QLineEdit, QComboBox, QGroupBox, 
                              QFormLayout, QSpinBox, QDialog, QDialogButtonBox, QHeaderView,
-                             QCheckBox, QSplitter, QTextEdit, QStatusBar, QMenuBar, QMenu, QAction,
+                             QCheckBox, QSplitter, QTextEdit, QStatusBar, QMenuBar, QMenu, 
                              QProgressBar, QListWidget, QListWidgetItem)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QByteArray
-from PyQt6.QtGui import QFont, QActionGroup, QIcon, QColor, QPalette
+from PyQt6.QtGui import QFont, QActionGroup, QIcon, QColor, QPalette, QAction
 
 # Import the core database manager
 try:
-    from Core_Attempt_2 import SQLiteTimeSeriesManager, DuckDBSyncManager
+    from . import SQLiteTimeSeriesManager, DuckDBSyncManager
 except ImportError:
     # Fallback mock for standalone testing if module isn't found
     class SQLiteTimeSeriesManager:
