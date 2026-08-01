@@ -36,6 +36,55 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 
 
+def load_type_mappings(config_path: str) -> Dict[str, str]:
+    """
+    Load custom type mappings from a JSON configuration file.
+    
+    This function reads a JSON file containing semantic type mappings and returns
+    them as a dictionary that can be passed to SQLiteTimeSeriesManager via the 
+    variables parameter.
+    
+    Expected JSON format:
+    {
+        "column_name": "SEMANTIC_TYPE",
+        ...
+    }
+    
+    Where SEMANTIC_TYPE is one of: TIMESTAMP, METRIC, CATEGORY, ID
+    
+    Args:
+        config_path: Path to the JSON configuration file
+        
+    Returns:
+        Dictionary mapping column names to semantic types
+        
+    Raises:
+        FileNotFoundError: If the configuration file does not exist
+        json.JSONDecodeError: If the file contains invalid JSON
+        ValueError: If an unknown semantic type is specified
+        
+    Example:
+        # type_mappings.json:
+        # {"Value": "METRIC", "Category": "CATEGORY", "Date": "TIMESTAMP"}
+        
+        mappings = load_type_mappings("type_mappings.json")
+        sqlite_db = SQLiteTimeSeriesManager(db_path, table_keys, variables=mappings)
+    """
+    with open(config_path, 'r') as f:
+        type_mappings = json.load(f)
+    
+    valid_types = {'TIMESTAMP', 'METRIC', 'CATEGORY', 'ID'}
+    for col, sem_type in type_mappings.items():
+        if sem_type not in valid_types:
+            raise ValueError(
+                f"Unknown semantic type '{sem_type}' for column '{col}'. "
+                f"Valid types are: {', '.join(valid_types)}"
+            )
+    
+    logging.info(f"Loaded {len(type_mappings)} type mappings from {config_path}")
+    return type_mappings
+
+
 # Custom exceptions for specific error scenarios
 class DatabaseError(Exception):
     """Base exception for database operations."""
@@ -54,6 +103,11 @@ class TypeConversionError(DatabaseError):
 
 class TransactionError(DatabaseError):
     """Exception raised when transaction operations fail."""
+    pass
+
+
+class SchemaVersionError(DatabaseError):
+    """Exception raised when database schema version does not match expected version."""
     pass
 
 
@@ -92,7 +146,7 @@ class SQLiteTimeSeriesManager:
     def __init__(self, db_path: str, table_keys: List[str], variables: Optional[Dict[str, str]] = None, 
                  default_user: str = "system", encryption_key: Optional[bytes] = None, 
                  enable_encryption: bool = False, compress: bool = False,
-                 sample_data: Optional[pd.DataFrame] = None):
+                 sample_data: Optional[pd.DataFrame] = None, type_config_path: Optional[str] = None):
         """
         Initialize the SQLite Time Series Manager.
         
@@ -119,10 +173,21 @@ class SQLiteTimeSeriesManager:
                         If provided, column types will be dynamically derived from the actual 
                         data types before schema creation. If not provided, types will be 
                         inferred from the first uploaded DataFrame.
+            type_config_path: Optional path to JSON configuration file containing type mappings.
+                             If provided, loads type mappings from file using load_type_mappings().
+                             Merges with variables parameter (type_config_path takes precedence).
         """
         self.db_path = db_path
         self.table_keys = table_keys  # Primary key columns for identifying unique records
-        self.variables = variables or {}  # Custom type overrides (empty dict if None)
+        
+        # Load type mappings from config file if provided
+        loaded_vars = {}
+        if type_config_path is not None:
+            loaded_vars = load_type_mappings(type_config_path)
+        
+        # Merge variables: type_config_path takes precedence over variables parameter
+        self.variables = {**variables, **loaded_vars} if variables else loaded_vars
+        
         self.default_user = default_user
         self.column_types = {}         # Derived SQL/Pandas types per column from data inference
         self.encryption_key = encryption_key
@@ -288,12 +353,23 @@ class SQLiteTimeSeriesManager:
         Create all required database tables if they don't exist.
         
         Tables created:
+        - _meta: Metadata table tracking schema_version for future migrations
         - type_conversions: Reference table for semantic type mappings (populated dynamically from input)
         - tx_log: Audit trail recording every transaction with before/after values
         - historical_data: Complete version history linked to transactions
         - live_data: Current state of all records (optimized for fast reads)
         """
         cur = self.conn.cursor()
+        
+        # Create metadata table to track schema version for future migrations
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS _meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        # Set current schema version (used for migration detection)
+        cur.execute("INSERT OR IGNORE INTO _meta VALUES ('schema_version', '1')")
         
         # Create type conversion reference table for consistent type handling across SQLite and DuckDB
         # Stores semantic type mappings with database-specific types (sqlite_type, duckdb_type, pandas_type)
@@ -1088,7 +1164,7 @@ class DuckDBSyncManager:
             )
         """)
 
-    def sync(self):
+    def sync(self, dry_run: bool = False) -> Optional[Dict[str, Any]]:
         """
         Incrementally sync new transactions from SQLite to DuckDB.
         
@@ -1100,6 +1176,26 @@ class DuckDBSyncManager:
         
         Only processes transactions with status='SUCCESS' to ensure data consistency.
         Efficient for large datasets as it only transfers changed data.
+        
+        Args:
+            dry_run: If True, simulates the sync without making any changes.
+                    Returns a statistics dictionary instead of modifying the database.
+                    
+        Returns:
+            If dry_run=True, returns a dictionary with sync statistics:
+                - 'new_transactions': Number of new transactions to sync
+                - 'upsert_count': Number of records to be upserted
+                - 'delete_count': Number of records to be deleted
+                - 'would_update_to_tx_id': The transaction ID that would be synced to
+            If dry_run=False, returns None after completing the sync.
+            
+        Example:
+            # Perform a dry run to see what would be synced
+            stats = duckdb.sync(dry_run=True)
+            print(f\"Would sync {stats['new_transactions']} transactions\")
+            
+            # Perform actual sync
+            duckdb.sync()
         """
         # Get the last transaction ID that was synced to DuckDB
         last_synced = self.conn.execute("SELECT value FROM _sync_metadata WHERE key='last_synced_tx_id'").fetchone()[0]
@@ -1113,6 +1209,13 @@ class DuckDBSyncManager:
         
         # No new transactions to sync - exit early
         if new_txs.empty:
+            if dry_run:
+                return {
+                    'new_transactions': 0,
+                    'upsert_count': 0,
+                    'delete_count': 0,
+                    'would_update_to_tx_id': last_synced
+                }
             return
 
         logging.info(f"Syncing {len(new_txs)} new transactions to DuckDB...")
@@ -1120,6 +1223,20 @@ class DuckDBSyncManager:
         # Separate transactions into upserts (APPEND/EDIT) and DELETEs
         upsert_keys_json = new_txs[new_txs['operation'] != 'DELETE']['table_keys_json'].unique()
         delete_keys_json = new_txs[new_txs['operation'] == 'DELETE']['table_keys_json'].unique()
+        
+        # Calculate statistics for dry run
+        delete_count = len(delete_keys_json)
+        upsert_count = len(upsert_keys_json)
+        max_tx_id = int(new_txs['tx_id'].max())
+        
+        # If dry run, return statistics without making changes
+        if dry_run:
+            return {
+                'new_transactions': len(new_txs),
+                'upsert_count': upsert_count,
+                'delete_count': delete_count,
+                'would_update_to_tx_id': max_tx_id
+            }
         
         # Process DELETE operations first
         if len(delete_keys_json) > 0:
@@ -1173,7 +1290,6 @@ class DuckDBSyncManager:
 
         # Update sync metadata with the highest transaction ID processed
         # This ensures next sync only processes newer transactions
-        max_tx_id = int(new_txs['tx_id'].max())  # Convert numpy.int64 to native Python int
         self.conn.execute("UPDATE _sync_metadata SET value = ? WHERE key='last_synced_tx_id'", [max_tx_id])
         logging.info(f"Sync complete. Updated to tx_id {max_tx_id}.")
 

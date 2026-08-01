@@ -3,28 +3,8 @@
 *.pyc
 __pycache__/
 
-# Database files
-*.duckdb
-*.db
-
-# Test files
-tests/*.db
-tests/*.duckdb
-
-# Environment
+# Environment files
 .env
 .env.local
 *.env.*
-
-# Logs and temp files
-*.log
-*.tmp
-
-# Editors
-.vscode/
-.idea/
-
-# OS specific
-.DS_Store
-Thumbs.db
 ```
